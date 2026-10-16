@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 def get_connection(db_path: str) -> sqlite3.Connection:
@@ -29,7 +29,9 @@ def init_db(db_path: str) -> None:
             "current_stage INTEGER DEFAULT 1,"
             "registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
             "last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-            "last_drip_sent_at TIMESTAMP NULL"
+            "last_drip_sent_at TIMESTAMP NULL,"
+            "day_8_sent INTEGER DEFAULT 0,"
+            "day_30_sent INTEGER DEFAULT 0"
             ");"
             "CREATE TABLE IF NOT EXISTS stage_messages ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -50,20 +52,37 @@ def init_db(db_path: str) -> None:
             "delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
             "UNIQUE(user_id, message_record_id)"
             ");"
+            "CREATE TABLE IF NOT EXISTS study_plans ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "user_id INTEGER NOT NULL,"
+            "duration_days INTEGER NOT NULL,"
+            "start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            "end_date TIMESTAMP NOT NULL,"
+            "reminder_date TIMESTAMP NOT NULL,"
+            "reminder_sent INTEGER DEFAULT 0,"
+            "report_submitted INTEGER DEFAULT 0,"
+            "report_text TEXT NULL,"
+            "status TEXT DEFAULT 'ACTIVE',"
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ");"
             "CREATE INDEX IF NOT EXISTS idx_stage ON stage_messages(stage);"
+            "CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans(user_id);"
         )
 
-        # Migration column checks
+        # Migration column checks for existing databases
+        for col_def in [
+            "assigned_name TEXT NULL",
+            "last_drip_sent_at TIMESTAMP NULL",
+            "day_8_sent INTEGER DEFAULT 0",
+            "day_30_sent INTEGER DEFAULT 0"
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE students ADD COLUMN {col_def};")
+            except sqlite3.OperationalError:
+                pass
+
         try:
             conn.execute("ALTER TABLE invites ADD COLUMN assigned_name TEXT NULL;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE students ADD COLUMN assigned_name TEXT NULL;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE students ADD COLUMN last_drip_sent_at TIMESTAMP NULL;")
         except sqlite3.OperationalError:
             pass
 
@@ -124,8 +143,8 @@ def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Opt
             )
 
             conn.execute(
-                "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?) "
+                "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, day_8_sent, day_30_sent) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, 0, 0) "
                 "ON CONFLICT(user_id) DO UPDATE SET "
                 "username = excluded.username, "
                 "full_name = excluded.full_name, "
@@ -141,7 +160,7 @@ def get_student(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, last_drip_sent_at FROM students WHERE user_id = ?",
+            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, last_drip_sent_at, day_8_sent, day_30_sent FROM students WHERE user_id = ?",
             (user_id,)
         )
         row = cur.fetchone()
@@ -157,6 +176,47 @@ def update_student_stage(db_path: str, user_id: int, new_stage: int) -> None:
                 "UPDATE students SET current_stage = ?, last_active = ? WHERE user_id = ?",
                 (new_stage, datetime.utcnow(), user_id)
             )
+    finally:
+        conn.close()
+
+def mark_milestone_sent(db_path: str, user_id: int, milestone_days: int) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            col = "day_8_sent" if milestone_days == 8 else "day_30_sent"
+            conn.execute(f"UPDATE students SET {col} = 1 WHERE user_id = ?", (user_id,))
+    finally:
+        conn.close()
+
+def get_students_due_for_milestones(db_path: str) -> List[Tuple[Dict[str, Any], int]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT user_id, username, full_name, assigned_name, registered_at, day_8_sent, day_30_sent FROM students"
+        )
+        students = [dict(row) for row in cur.fetchall()]
+        due = []
+        now = datetime.utcnow()
+
+        for st in students:
+            reg_str = st.get("registered_at")
+            if not reg_str:
+                continue
+            try:
+                if isinstance(reg_str, str):
+                    reg_dt = datetime.fromisoformat(reg_str.replace("Z", ""))
+                else:
+                    reg_dt = reg_str
+                diff_days = (now - reg_dt).total_seconds() / 86400.0
+
+                if diff_days >= 8.0 and not st.get("day_8_sent"):
+                    due.append((st, 8))
+
+                if diff_days >= 30.0 and not st.get("day_30_sent"):
+                    due.append((st, 30))
+            except Exception:
+                continue
+        return due
     finally:
         conn.close()
 
@@ -187,7 +247,7 @@ def list_students(db_path: str) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, last_drip_sent_at FROM students ORDER BY registered_at DESC"
+            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, last_drip_sent_at, day_8_sent, day_30_sent FROM students ORDER BY registered_at DESC"
         )
         return [dict(row) for row in cur.fetchall()]
     finally:
@@ -235,7 +295,7 @@ def record_drip_delivery(db_path: str, user_id: int, message_record_id: int) -> 
     finally:
         conn.close()
 
-def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = False) -> List[Dict[str, Any]]:
+def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = False) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
     conn = get_connection(db_path)
     try:
         interval_days = int(get_setting(db_path, "drip_interval_days", "2"))
@@ -248,7 +308,6 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
         now = datetime.utcnow()
 
         for st in candidates:
-            # Check if there is an unsent message in stage 4
             next_msg = get_next_unsent_drip_message(db_path, st["user_id"])
             if not next_msg:
                 continue
@@ -262,12 +321,101 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
                 eligible.append((st, next_msg))
             else:
                 try:
-                    last_sent = datetime.fromisoformat(last_sent_str) if isinstance(last_sent_str, str) else last_sent_str
+                    if isinstance(last_sent_str, str):
+                        last_sent = datetime.fromisoformat(last_sent_str.replace("Z", ""))
+                    else:
+                        last_sent = last_sent_str
                     diff_days = (now - last_sent).total_seconds() / 86400.0
                     if diff_days >= interval_days:
                         eligible.append((st, next_msg))
                 except Exception:
                     eligible.append((st, next_msg))
         return eligible
+    finally:
+        conn.close()
+
+# --- Study Plans (Periodic 7-day, 8-day, 9-day schedules) ---
+
+def create_study_plan(db_path: str, user_id: int, duration_days: int) -> int:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            # Mark previous active plans as superseded
+            conn.execute("UPDATE study_plans SET status = 'SUPERSEDED' WHERE user_id = ? AND status = 'ACTIVE'", (user_id,))
+
+            now = datetime.utcnow()
+            end_date = now + timedelta(days=duration_days)
+            # Reminder is 1 day before expiration (or now if 1-day plan)
+            reminder_date = end_date - timedelta(days=1)
+            if reminder_date < now:
+                reminder_date = now
+
+            cur = conn.execute(
+                "INSERT INTO study_plans (user_id, duration_days, start_date, end_date, reminder_date, reminder_sent, report_submitted, status) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0, 'ACTIVE')",
+                (user_id, duration_days, now, end_date, reminder_date)
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+def get_active_study_plan(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT id, user_id, duration_days, start_date, end_date, reminder_date, reminder_sent, report_submitted, report_text, status "
+            "FROM study_plans WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT') ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def get_study_plans_due_for_reminder(db_path: str) -> List[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        now = datetime.utcnow()
+        cur = conn.execute(
+            "SELECT sp.id, sp.user_id, sp.duration_days, sp.start_date, sp.end_date, sp.reminder_date, "
+            "s.full_name, s.assigned_name, s.username "
+            "FROM study_plans sp "
+            "JOIN students s ON sp.user_id = s.user_id "
+            "WHERE sp.status = 'ACTIVE' AND sp.reminder_sent = 0 AND sp.reminder_date <= ?",
+            (now,)
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def mark_study_plan_reminder_sent(db_path: str, plan_id: int) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE study_plans SET reminder_sent = 1, status = 'REMINDER_SENT' WHERE id = ?",
+                (plan_id,)
+            )
+    finally:
+        conn.close()
+
+def submit_study_plan_report(db_path: str, user_id: int, report_text: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "SELECT id, duration_days FROM study_plans WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT') ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            )
+            plan = cur.fetchone()
+            if not plan:
+                return None
+
+            plan_id = plan["id"]
+            conn.execute(
+                "UPDATE study_plans SET report_submitted = 1, report_text = ?, status = 'REPORT_SUBMITTED' WHERE id = ?",
+                (report_text, plan_id)
+            )
+            return {"plan_id": plan_id, "duration_days": plan["duration_days"]}
     finally:
         conn.close()
