@@ -330,6 +330,81 @@ async def execute_study_plans_reminders(bot) -> int:
 
     return sent_count
 
+async def execute_inactivity_warnings(bot) -> int:
+    due_students = database.get_students_due_for_inactivity_warning(config.DB_PATH, threshold_days=2.0)
+    sent_count = 0
+
+    for st in due_students:
+        user_id = st["user_id"]
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        stage = st["current_stage"]
+        next_stage = stage + 1
+
+        warning_text = (
+            f"⚠️ **{name} عزیز، یک یادآوری بسیار مهم!** ⏳\n\n"
+            f"الان بیش از ۲ روز است که ویس‌های **مرحله {stage}** را گوش نداده‌اید!\n"
+            "مسیر مشاوره نیازمند استمرار و تعهد شماست و نباید از برنامه عقب بمانید 🌱\n\n"
+            "📌 **حتماً تا آخر امشب وقت بگذارید، ویس‌های این مرحله را کامل گوش دهید و وارد مرحله بعد شوید.**\n\n"
+            f"🔒 **توجه:** در حال حاضر برای شما محدودیت ایجاد شده است چون هنوز در مرحله {stage} هستید. "
+            "به محض اینکه وارد فاز ۴ شوید، یک سری ویس‌ها و آموزش‌های بسیار تکمیلی و کلیدی برایتان ارسال می‌شود که جهش بزرگی در روند مطالعه شما ایجاد خواهد کرد 🚀✨\n\n"
+            "👇 همین الان ویس‌ها را گوش دهید و پس از اتمام دکمه زیر را لمس کنید:"
+        )
+
+        btn_text = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_stage} ➡️" if next_stage <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}")],
+            [InlineKeyboardButton(f"🔵 🔄 ارسال مجدد ویس‌های مرحله {stage} 🔁", callback_data=f"student_resend_stage_{stage}")]
+        ])
+
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=warning_text,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+            database.mark_inactivity_warning_sent(config.DB_PATH, user_id)
+            sent_count += 1
+            logger.info(f"Inactivity warning sent to student {name} ({user_id}) for stage {stage}.")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Error sending inactivity warning to user {user_id}: {e}")
+
+    return sent_count
+
+def generate_students_stats_report() -> str:
+    students = database.list_students(config.DB_PATH)
+    counts = database.get_student_count_by_stage(config.DB_PATH)
+
+    s4 = counts.get(4, 0)
+    total = len(students)
+
+    report = (
+        "📊 **آمار و وضعیت دانش‌آموزان مشاوره:** 📈\n\n"
+        f"👥 کل دانش‌آموزان ثبت‌شده: {total} نفر\n"
+        f"🚀 وارد شده به فاز ۴: {s4} نفر\n\n"
+        "📋 **لیست دانش‌آموزان:**\n"
+    )
+
+    if not students:
+        report += "هنوز دانش‌آموزی ثبت‌نام نکرده است.\n"
+        return report
+
+    now = datetime.utcnow()
+    for idx, st in enumerate(students, start=1):
+        disp_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        reg_str = st.get("registered_at")
+        day_num = 1
+        if reg_str:
+            try:
+                dt = datetime.fromisoformat(str(reg_str).replace("Z", ""))
+                day_num = max(1, (now - dt).days + 1)
+            except Exception:
+                day_num = 1
+        report += f"{idx}. **{disp_name}** ⬅️ روز {day_num}\n"
+
+    return report
+
 # --- Core Handlers ---
 
 async def start_handler(update, context):
@@ -608,43 +683,7 @@ async def admin_callback_handler(update, context):
         )
 
     elif data == "admin_stats":
-        students = database.list_students(config.DB_PATH)
-        counts = database.get_student_count_by_stage(config.DB_PATH)
-
-        s1 = counts.get(1, 0)
-        s2 = counts.get(2, 0)
-        s3 = counts.get(3, 0)
-        s4 = counts.get(4, 0)
-        total = len(students)
-
-        report = (
-            "📊 **آمار و وضعیت دانش‌آموزان مشاوره:** 📈\n\n"
-            f"👥 کل دانش‌آموزان ثبت‌شده: {total} نفر\n"
-            f"• در حال گذراندن مرحله ۱: {s1} نفر 🎓\n"
-            f"• در حال گذراندن مرحله ۲: {s2} نفر 📚\n"
-            f"• در حال گذراندن مرحله ۳: {s3} نفر 🧠\n"
-            f"• وارد شده به فاز ۴: {s4} نفر 🚀\n\n"
-            "📋 **لیست دانش‌آموزان:**\n"
-        )
-        now = datetime.utcnow()
-        for idx, st in enumerate(students[:20], start=1):
-            disp_name = st.get("assigned_name") or st.get("full_name")
-            uname = f"@{st['username']}" if st["username"] else "بدون یوزرنیم"
-            reg_str = st.get("registered_at")
-            days_ago = ""
-            if reg_str:
-                try:
-                    dt = datetime.fromisoformat(str(reg_str).replace("Z", ""))
-                    days_ago = f" (روز {(now - dt).days + 1})"
-                except Exception:
-                    pass
-            d8 = "✅" if st.get("day_8_sent") else "⏳"
-            d30 = "✅" if st.get("day_30_sent") else "⏳"
-            report += f"{idx}. **{disp_name}** ({uname}){days_ago} ⬅️ مرحله {st['current_stage']} | روز۸: {d8} | روز۳۰: {d30}\n"
-
-        if total == 0:
-            report += "هنوز دانش‌آموزی ثبت‌نام نکرده است.\n"
-
+        report = generate_students_stats_report()
         await query.message.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
 
 # --- Student Callback Handler ---
@@ -686,6 +725,14 @@ async def student_callback_handler(update, context):
                 parse_mode="Markdown",
                 reply_markup=get_student_reply_keyboard(4)
             )
+
+    elif data.startswith("student_resend_stage_"):
+        st_num = int(data.split("_")[-1])
+        await query.message.reply_text(
+            f"🔄 **{name} عزیز، محتوای مرحله {st_num} مجدداً برای شما ارسال می‌شود:**",
+            parse_mode="Markdown"
+        )
+        await deliver_stage_content(context.bot, user_id, stage=st_num, next_stage=st_num + 1, greeting_name=name)
 
     elif data == "student_start_report":
         active_states[user_id] = "AWAITING_STUDY_REPORT"
@@ -869,40 +916,7 @@ async def message_collector(update, context):
             return
 
         elif "آمار و وضعیت دانش‌آموزان" in text:
-            students = database.list_students(config.DB_PATH)
-            counts = database.get_student_count_by_stage(config.DB_PATH)
-            s1 = counts.get(1, 0)
-            s2 = counts.get(2, 0)
-            s3 = counts.get(3, 0)
-            s4 = counts.get(4, 0)
-            report = (
-                "📊 **آمار و وضعیت دانش‌آموزان مشاوره:** 📈\n\n"
-                f"👥 کل دانش‌آموزان ثبت‌شده: {len(students)} نفر\n"
-                f"• در حال گذراندن مرحله ۱: {s1} نفر 🎓\n"
-                f"• در حال گذراندن مرحله ۲: {s2} نفر 📚\n"
-                f"• در حال گذراندن مرحله ۳: {s3} نفر 🧠\n"
-                f"• وارد شده به فاز ۴: {s4} نفر 🚀\n\n"
-                "📋 **لیست دانش‌آموزان:**\n"
-            )
-            now = datetime.utcnow()
-            for idx, st in enumerate(students[:20], start=1):
-                disp_name = st.get("assigned_name") or st.get("full_name")
-                uname = f"@{st['username']}" if st["username"] else "بدون یوزرنیم"
-                reg_str = st.get("registered_at")
-                days_ago = ""
-                if reg_str:
-                    try:
-                        dt = datetime.fromisoformat(str(reg_str).replace("Z", ""))
-                        days_ago = f" (روز {(now - dt).days + 1})"
-                    except Exception:
-                        pass
-                d8 = "✅" if st.get("day_8_sent") else "⏳"
-                d30 = "✅" if st.get("day_30_sent") else "⏳"
-                report += f"{idx}. **{disp_name}** ({uname}){days_ago} ⬅️ مرحله {st['current_stage']} | روز۸: {d8} | روز۳۰: {d30}\n"
-
-            if len(students) == 0:
-                report += "هنوز دانش‌آموزی ثبت‌نام نکرده است.\n"
-
+            report = generate_students_stats_report()
             await msg.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
             return
 
@@ -1032,6 +1046,10 @@ async def drip_scheduler_loop(app):
             plan_reminders = await execute_study_plans_reminders(app.bot)
             if plan_reminders > 0:
                 logger.info(f"Sent {plan_reminders} study plan 1-day reminders.")
+
+            inactivity_warns = await execute_inactivity_warnings(app.bot)
+            if inactivity_warns > 0:
+                logger.info(f"Sent {inactivity_warns} 2-day inactivity warnings to students.")
 
         except Exception as e:
             logger.error(f"Error in drip_scheduler_loop: {e}")

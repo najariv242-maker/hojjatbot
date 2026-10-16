@@ -29,6 +29,8 @@ def init_db(db_path: str) -> None:
             "current_stage INTEGER DEFAULT 1,"
             "registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
             "last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            "stage_updated_at TIMESTAMP NULL,"
+            "stage_warning_sent INTEGER DEFAULT 0,"
             "last_drip_sent_at TIMESTAMP NULL,"
             "day_8_sent INTEGER DEFAULT 0,"
             "day_30_sent INTEGER DEFAULT 0"
@@ -74,12 +76,20 @@ def init_db(db_path: str) -> None:
             "assigned_name TEXT NULL",
             "last_drip_sent_at TIMESTAMP NULL",
             "day_8_sent INTEGER DEFAULT 0",
-            "day_30_sent INTEGER DEFAULT 0"
+            "day_30_sent INTEGER DEFAULT 0",
+            "stage_updated_at TIMESTAMP NULL",
+            "stage_warning_sent INTEGER DEFAULT 0"
         ]:
             try:
                 conn.execute(f"ALTER TABLE students ADD COLUMN {col_def};")
             except sqlite3.OperationalError:
                 pass
+
+        # Backfill stage_updated_at for existing records
+        try:
+            conn.execute("UPDATE students SET stage_updated_at = COALESCE(last_active, registered_at, CURRENT_TIMESTAMP) WHERE stage_updated_at IS NULL;")
+        except sqlite3.OperationalError:
+            pass
 
         try:
             conn.execute("ALTER TABLE invites ADD COLUMN assigned_name TEXT NULL;")
@@ -143,14 +153,14 @@ def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Opt
             )
 
             conn.execute(
-                "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, day_8_sent, day_30_sent) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?, 0, 0) "
+                "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, day_8_sent, day_30_sent) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0) "
                 "ON CONFLICT(user_id) DO UPDATE SET "
                 "username = excluded.username, "
                 "full_name = excluded.full_name, "
                 "assigned_name = COALESCE(excluded.assigned_name, students.assigned_name), "
                 "last_active = excluded.last_active",
-                (user_id, username, full_name, assigned_name, now, now)
+                (user_id, username, full_name, assigned_name, now, now, now)
             )
         return True, assigned_name
     finally:
@@ -160,7 +170,7 @@ def get_student(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, last_drip_sent_at, day_8_sent, day_30_sent FROM students WHERE user_id = ?",
+            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, last_drip_sent_at, day_8_sent, day_30_sent FROM students WHERE user_id = ?",
             (user_id,)
         )
         row = cur.fetchone()
@@ -172,9 +182,50 @@ def update_student_stage(db_path: str, user_id: int, new_stage: int) -> None:
     conn = get_connection(db_path)
     try:
         with conn:
+            now = datetime.utcnow()
             conn.execute(
-                "UPDATE students SET current_stage = ?, last_active = ? WHERE user_id = ?",
-                (new_stage, datetime.utcnow(), user_id)
+                "UPDATE students SET current_stage = ?, last_active = ?, stage_updated_at = ?, stage_warning_sent = 0 WHERE user_id = ?",
+                (new_stage, now, now, user_id)
+            )
+    finally:
+        conn.close()
+
+def get_students_due_for_inactivity_warning(db_path: str, threshold_days: float = 2.0) -> List[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, stage_updated_at, stage_warning_sent "
+            "FROM students "
+            "WHERE current_stage BETWEEN 1 AND 3 AND (stage_warning_sent IS NULL OR stage_warning_sent = 0)"
+        )
+        candidates = [dict(row) for row in cur.fetchall()]
+        due = []
+        now = datetime.utcnow()
+        for st in candidates:
+            st_time = st.get("stage_updated_at") or st.get("registered_at")
+            if not st_time:
+                continue
+            try:
+                if isinstance(st_time, str):
+                    st_dt = datetime.fromisoformat(st_time.replace("Z", ""))
+                else:
+                    st_dt = st_time
+                diff_days = (now - st_dt).total_seconds() / 86400.0
+                if diff_days >= threshold_days:
+                    due.append(st)
+            except Exception:
+                continue
+        return due
+    finally:
+        conn.close()
+
+def mark_inactivity_warning_sent(db_path: str, user_id: int) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE students SET stage_warning_sent = 1 WHERE user_id = ?",
+                (user_id,)
             )
     finally:
         conn.close()
