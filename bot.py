@@ -29,7 +29,6 @@ try:
         filters,
     )
 except ImportError:
-    # If python-telegram-bot is not installed yet (e.g. inside build container)
     Update = None
     InlineKeyboardButton = None
     InlineKeyboardMarkup = None
@@ -101,8 +100,7 @@ async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int):
 
     await bot.send_message(
         chat_id=chat_id,
-        text=f"📚 **محتوای مرحله {stage} برای شما ارسال می‌شود:**
-لطفاً ویس‌ها و نکات زیر را با دقت گوش داده و یادداشت‌برداری کنید.",
+        text=f"📚 **محتوای مرحله {stage} برای شما ارسال می‌شود:**\nلطفاً ویس‌ها و نکات زیر را با دقت گوش داده و یادداشت‌برداری کنید.",
         parse_mode="Markdown"
     )
 
@@ -115,7 +113,7 @@ async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int):
             )
             await asyncio.sleep(0.3)
         except Exception as e:
-            logger.warning(f"Failed to copy message {item[message_id]} for stage {stage}: {e}")
+            logger.warning(f"Failed to copy message {item.get(message_id)} for stage {stage}: {e}")
 
     await bot.send_message(
         chat_id=chat_id,
@@ -150,7 +148,7 @@ async def deliver_section_4(bot, chat_id: int):
             )
             await asyncio.sleep(0.3)
         except Exception as e:
-            logger.warning(f"Failed to copy section 4 message {item[message_id]}: {e}")
+            logger.warning(f"Failed to copy section 4 message {item.get(message_id)}: {e}")
 
     await bot.send_message(
         chat_id=chat_id,
@@ -171,7 +169,7 @@ async def start_handler(update, context):
     # 1. Admin check
     if config.ADMIN_ID and user_id == config.ADMIN_ID:
         await update.message.reply_text(
-            f"👑 **سلام آقای دکتر / مشاور گرامی**\nخوش آمدید به پنل مدیریت ربات مشاوره هاشمی.",
+            "👑 **سلام آقای دکتر / مشاور گرامی**\nخوش آمدید به پنل مدیریت ربات مشاوره هاشمی.",
             parse_mode="Markdown",
             reply_markup=get_admin_main_keyboard()
         )
@@ -187,8 +185,8 @@ async def start_handler(update, context):
         if success:
             await update.message.reply_text(
                 f"🌸 **سلام {user_name} عزیز، به ربات مشاوره تحصیلی خوش آمدید!**\n\n"
-                f"شما با موفقیت ثبت‌نام شدید. فرآیند آموزشی شما در ۳ مرحله طراحی شده است.\n"
-                f"آماده‌اید؟ مرحله اول همین الان برای شما ارسال می‌شود:",
+                "شما با موفقیت ثبت‌نام شدید. فرآیند آموزشی شما در ۳ مرحله طراحی شده است.\n"
+                "آماده‌اید؟ مرحله اول همین الان برای شما ارسال می‌شود:",
                 parse_mode="Markdown"
             )
             await deliver_stage_content(context.bot, user_id, stage=1, next_stage=2)
@@ -215,7 +213,7 @@ async def start_handler(update, context):
         else:
             await update.message.reply_text(
                 f"🎉 **سلام {user_name} عزیز!**\n"
-                f"شما دوره‌های ۳ مرحله‌ای اولیه را تکمیل کرده‌اید و به بخش ۴ دسترسی کامل دارید.",
+                "شما دوره‌های ۳ مرحله‌ای اولیه را تکمیل کرده‌اید و به بخش ۴ دسترسی کامل دارید.",
                 parse_mode="Markdown",
                 reply_markup=get_student_hub_keyboard()
             )
@@ -250,7 +248,7 @@ async def admin_callback_handler(update, context):
         )
 
     elif data == "admin_gen_invite":
-        token = secrets.token_hex(4)  # 8 char hex
+        token = secrets.token_hex(4)
         code = f"inv_{token}"
         database.create_invite(config.DB_PATH, code)
 
@@ -259,11 +257,11 @@ async def admin_callback_handler(update, context):
         invite_link = f"https://t.me/{bot_user}?start={code}"
 
         msg = (
-            f"🔗 **لینک دعوت اختصاصی یکبارمصرف ساخته شد:**\n\n"
+            "🔗 **لینک دعوت اختصاصی یکبارمصرف ساخته شد:**\n\n"
             f"`{invite_link}`\n\n"
-            f"📌 **نکات مهم:**\n"
-            f"• این لینک را کپی کرده و برای دانش‌آموز جدید ارسال کنید.\n"
-            f"• لینک فقط ۱ بار قابل استفاده است و به محض ورود دانش‌آموز خودکار باطل می‌شود."
+            "📌 **نکات مهم:**\n"
+            "• این لینک را کپی کرده و برای دانش‌آموز جدید ارسال کنید.\n"
+            "• لینک فقط ۱ بار قابل استفاده است و به محض ورود دانش‌آموز خودکار باطل می‌شود."
         )
         await query.message.reply_text(msg, parse_mode="Markdown")
 
@@ -282,9 +280,9 @@ async def admin_callback_handler(update, context):
 
         await query.edit_message_text(
             f"🎙 **حالت ذخیره‌سازی برای «{stage_title}» فعال شد.**\n\n"
-            f"📥 هم‌اکنون پیام‌ها، ویس‌ها، متن‌ها و فایل‌های این مرحله را از گروه مشاوره به این چت فوروارد کنید.\n"
-            f"هر پیامی بفرستید خودکار ذخیره می‌شود.\n"
-            f"وقتی تمام پیام‌های این بخش را فرستادید، دکمه «اتمام ذخیره» را بزنید.",
+            "📥 هم‌اکنون پیام‌ها، ویس‌ها، متن‌ها و فایل‌های این مرحله را از گروه مشاوره به این چت فوروارد کنید.\n"
+            "هر پیامی بفرستید خودکار ذخیره می‌شود.\n"
+            "وقتی تمام پیام‌های این بخش را فرستادید، دکمه «اتمام ذخیره» را بزنید.",
             parse_mode="Markdown",
             reply_markup=get_stop_recording_keyboard()
         )
@@ -297,7 +295,7 @@ async def admin_callback_handler(update, context):
         await query.edit_message_text(
             f"✅ **ذخیره پیام‌های مرحله با موفقیت به پایان رسید.**\n"
             f"مجموع پیام‌های ذخیره شده در این مرحله: {count} پیام.\n\n"
-            f"به پنل اصلی بازگشتید.",
+            "به پنل اصلی بازگشتید.",
             parse_mode="Markdown",
             reply_markup=get_admin_main_keyboard()
         )
@@ -313,13 +311,13 @@ async def admin_callback_handler(update, context):
         total = len(students)
 
         report = (
-            f"📊 **آمار و وضعیت دانش‌آموزان:**\n\n"
+            "📊 **آمار و وضعیت دانش‌آموزان:**\n\n"
             f"👥 کل دانش‌آموزان عضو: {total} نفر\n"
             f"• در حال گذراندن مرحله ۱: {s1} نفر\n"
             f"• در حال گذراندن مرحله ۲: {s2} نفر\n"
             f"• در حال گذراندن مرحله ۳: {s3} نفر\n"
             f"• فارغ‌التحصیل و در بخش ۴: {s4} نفر\n\n"
-            f"📋 **آخرین دانش‌آموزان ثبت‌نام شده:**\n"
+            "📋 **آخرین دانش‌آموزان ثبت‌نام شده:**\n"
         )
         for idx, st in enumerate(students[:10], start=1):
             uname = f"@{st[username]}" if st["username"] else "بدون یوزرنیم"
@@ -351,7 +349,7 @@ async def student_callback_handler(update, context):
         if next_stage <= 3:
             await query.message.reply_text(
                 f"👏 **آفرین بر شما! مرحله {next_stage} باز شد.**\n"
-                f"فایل‌های آموزشی این مرحله ارسال می‌شوند:",
+                "فایل‌های آموزشی این مرحله ارسال می‌شوند:",
                 parse_mode="Markdown"
             )
             await deliver_stage_content(context.bot, user_id, stage=next_stage, next_stage=next_stage + 1)
@@ -428,8 +426,11 @@ def main():
     logger.info("Database initialized successfully.")
 
     # Start 24/7 keep-alive server and 5-minute ping loop for Render
-    from keep_alive import start_keep_alive
-    start_keep_alive(port=config.PORT, ping_url=config.RENDER_EXTERNAL_URL)
+    try:
+        from keep_alive import start_keep_alive
+        start_keep_alive(port=config.PORT, ping_url=config.RENDER_EXTERNAL_URL)
+    except Exception as e:
+        logger.warning(f"Keep-alive server warning: {e}")
 
     app = create_application()
     if not app:
