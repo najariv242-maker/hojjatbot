@@ -8,6 +8,7 @@ from typing import Optional, Dict
 
 import config
 import database
+import motivational_quotes
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Active states: "AWAITING_STUDENT_NAME", "RECORD_STAGE_...", "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT"
 active_states: Dict[int, Optional[str]] = {}
+active_package_ids: Dict[int, int] = {}
 
 try:
     from telegram import (
@@ -52,11 +54,21 @@ IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 def get_iran_now():
     return datetime.now(IRAN_TZ)
 
+def escape_md(text: Optional[str]) -> str:
+    """Escapes Telegram Markdown (V1) special characters: _, *, `, ["""
+    if text is None:
+        return ""
+    text_str = str(text)
+    for ch in ("_", "*", "`", "["):
+        text_str = text_str.replace(ch, f"\\{ch}")
+    return text_str
+
 def is_admin(user_id: int, username: Optional[str]) -> bool:
     if config.ADMIN_ID and user_id == config.ADMIN_ID:
         return True
-    if username and config.ADMIN_USERNAME and username.lower() == config.ADMIN_USERNAME.lower():
-        return True
+    if username and config.ADMIN_USERNAME:
+        if username.lower().lstrip("@") == config.ADMIN_USERNAME.lower().lstrip("@"):
+            return True
     return False
 
 # --- Persistent Bottom Reply Keyboards (With Vivid Color Badges) ---
@@ -66,7 +78,8 @@ def get_admin_reply_keyboard():
         [KeyboardButton("🟢 🔗 ساخت لینک جدید (با نام) 👤"), KeyboardButton("🔵 📁 بارگذاری محتوای مراحل 📥")],
         [KeyboardButton("🟣 🎙 افزودن فایل به بخش ۴ 💡"), KeyboardButton("🟠 🎯 محتوای روز ۸ و ۳۰ 🏆")],
         [KeyboardButton("🟡 🗓 برنامه درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯"), KeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار ⚙️")],
-        [KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈"), KeyboardButton("👑 🏠 منوی اصلی مدیریت 👑")]
+        [KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈"), KeyboardButton("☀️ 💬 تست جمله انگیزشی ۷ صبح")],
+        [KeyboardButton("💾 دریافت بکاپ دیتابیس 📦"), KeyboardButton("👑 🏠 منوی اصلی مدیریت 👑")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -97,11 +110,13 @@ def get_admin_main_inline_keyboard():
     keyboard = [
         [InlineKeyboardButton("🟢 🔗 ساخت لینک اختصاصی (با نام) 👤", callback_data="admin_ask_name", style="success")],
         [InlineKeyboardButton("🔵 📁 مدیریت و بارگذاری محتوای مراحل 📥", callback_data="admin_manage_stages", style="primary")],
-        [InlineKeyboardButton("🟣 🎙 افزودن ویس به بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
+        [InlineKeyboardButton("🟣 🎙 افزودن بسته آموزشی به بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
         [InlineKeyboardButton("🟠 🎯 تنظیم محتوای روز ۸ و ۳۰ 🏆", callback_data="admin_milestones_menu", style="primary")],
         [InlineKeyboardButton("🟡 🗓 برنامه‌ریزی درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯", callback_data="admin_plans_menu", style="primary")],
         [InlineKeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار بخش ۴ ⚙️", callback_data="admin_drip_settings", style="primary")],
+        [InlineKeyboardButton("☀️ 💬 تست و مشاهده پیام انگیزشی ۷ صبح 🚀", callback_data="admin_test_quote", style="primary")],
         [InlineKeyboardButton("📊 📈 لیست و وضعیت دقیق دانش‌آموزان 📈", callback_data="admin_stats", style="success")],
+        [InlineKeyboardButton("💾 📦 دریافت نسخه پشتیبان دیتابیس (Backup)", callback_data="admin_download_db", style="primary")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -184,7 +199,8 @@ async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, 
         )
         return
 
-    name_phrase = f"{greeting_name} عزیز، " if greeting_name else ""
+    safe_greeting = escape_md(greeting_name)
+    name_phrase = f"{safe_greeting} عزیز، " if safe_greeting else ""
     await bot.send_message(
         chat_id=chat_id,
         text=f"📚 **{name_phrase}محتوای مرحله {stage} برای شما ارسال می‌شود:**\n"
@@ -224,27 +240,51 @@ async def execute_drip_cycle(bot, force_ignore_interval: bool = False) -> int:
     eligible_pairs = database.get_eligible_students_for_drip(config.DB_PATH, force_ignore_interval=force_ignore_interval)
     sent_count = 0
 
-    for st, msg in eligible_pairs:
+    for st, pkg_msgs in eligible_pairs:
         user_id = st["user_id"]
-        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
-        caption_text = f"\n\n{msg.get('caption')}" if msg.get("caption") else ""
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
+        if not pkg_msgs:
+            continue
+
+        pkg_id = pkg_msgs[0].get("package_id") or pkg_msgs[0]["id"]
+        msg_ids = [m["id"] for m in pkg_msgs]
+
         try:
+            if len(pkg_msgs) > 1:
+                intro = (
+                    f"🌸 **سلام {name} عزیز، وقتت بخیر!** 🌱✨\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎙🎬 **مبحث تکمیلی جدید دکتر هاشمی ({len(pkg_msgs)} فایل پیوسته) برای شما ارسال می‌شود:**\n\n"
+                    "📌 لطفاً تمام فایل‌های این بسته آموزشی (ویدیو/عکس و ویس توضیحات) را با دقت و به ترتیب مشاهده کرده و گوش دهید 🎓"
+                )
+            else:
+                caption_text = f"\n\n{escape_md(pkg_msgs[0].get('caption'))}" if pkg_msgs[0].get("caption") else ""
+                intro = (
+                    f"🌸 **سلام {name} عزیز، وقتت بخیر!** 🌱✨\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎙 **مبحث تکمیلی جدید از طرف دکتر هاشمی برای شما ارسال می‌شود:**{caption_text}"
+                )
+
             await bot.send_message(
                 chat_id=user_id,
-                text=f"🌸 **سلام {name} عزیز، وقتت بخیر!** 🌱\n"
-                     f"🎙 مبحث تکمیلی جدید از طرف دکتر هاشمی برای شما ارسال می‌شود:{caption_text}",
+                text=intro,
                 parse_mode="Markdown"
             )
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=msg["from_chat_id"],
-                message_id=msg["message_id"]
-            )
-            database.record_drip_delivery(config.DB_PATH, user_id, msg["id"])
+
+            for m in pkg_msgs:
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=m["from_chat_id"],
+                    message_id=m["message_id"]
+                )
+                await asyncio.sleep(0.4)
+
+            database.record_drip_package_delivery(config.DB_PATH, user_id, pkg_id, msg_ids)
             sent_count += 1
             await asyncio.sleep(0.5)
         except Exception as e:
-            logger.error(f"Error delivering drip message to student {user_id}: {e}")
+            logger.error(f"Error delivering drip package {pkg_id} to student {user_id}: {e}")
 
     return sent_count
 
@@ -254,7 +294,8 @@ async def execute_milestones_check(bot) -> int:
 
     for st, milestone in due_list:
         user_id = st["user_id"]
-        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
         msgs = database.get_stage_messages(config.DB_PATH, milestone)
         if not msgs:
             continue
@@ -296,7 +337,8 @@ async def execute_study_plans_reminders(bot) -> int:
 
     for plan in due_plans:
         user_id = plan["user_id"]
-        name = plan.get("assigned_name") or plan.get("full_name") or "دانش‌آموز"
+        raw_name = plan.get("assigned_name") or plan.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
         duration = plan["duration_days"]
 
         msg = (
@@ -336,7 +378,8 @@ async def execute_inactivity_warnings(bot) -> int:
 
     for st in due_students:
         user_id = st["user_id"]
-        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
         stage = st["current_stage"]
         next_stage = stage + 1
 
@@ -365,24 +408,90 @@ async def execute_inactivity_warnings(bot) -> int:
             )
             database.mark_inactivity_warning_sent(config.DB_PATH, user_id)
             sent_count += 1
-            logger.info(f"Inactivity warning sent to student {name} ({user_id}) for stage {stage}.")
+            logger.info(f"Inactivity warning sent to student {raw_name} ({user_id}) for stage {stage}.")
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Error sending inactivity warning to user {user_id}: {e}")
 
     return sent_count
 
+async def execute_morning_quotes_cycle(bot, target_user_id: Optional[int] = None) -> int:
+    """Delivers daily 7:00 AM non-cliché motivational quotes to students."""
+    today_str = get_iran_now().strftime("%Y-%m-%d")
+    
+    # If not a manual test on a specific user, check if already sent today
+    if not target_user_id:
+        last_sent_date = database.get_setting(config.DB_PATH, "last_morning_quote_date", "")
+        if last_sent_date == today_str:
+            return 0
+
+    if target_user_id:
+        st_obj = database.get_student(config.DB_PATH, target_user_id)
+        if st_obj:
+            students = [st_obj]
+        else:
+            students = [{"user_id": target_user_id, "full_name": "مدیر محترم", "assigned_name": "دکتر هاشمی"}]
+    else:
+        students = database.list_students(config.DB_PATH)
+
+    if not students:
+        return 0
+
+    try:
+        curr_idx = int(database.get_setting(config.DB_PATH, "morning_quote_index", "0"))
+    except ValueError:
+        curr_idx = 0
+
+    quote_text = motivational_quotes.get_motivational_quote(curr_idx)
+    sent_count = 0
+
+    for st in students:
+        if not st:
+            continue
+        user_id = st["user_id"]
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
+
+        msg_text = (
+            f"☀️ **صبح بخیر {name} عزیز** 🌱✨\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ « **{escape_md(quote_text)}** »\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🎯 *امروز یک روز طلایی برای پیشرفت و سبقت گرفتنه؛ با تمام تمرکز و پرانرژی استارت بزن!* 🚀🎓"
+        )
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=msg_text,
+                parse_mode="Markdown"
+            )
+            sent_count += 1
+            await asyncio.sleep(0.15)
+        except Exception as e:
+            logger.warning(f"Could not send morning quote to {user_id}: {e}")
+
+    if not target_user_id:
+        database.set_setting(config.DB_PATH, "last_morning_quote_date", today_str)
+        database.set_setting(config.DB_PATH, "morning_quote_index", str((curr_idx + 1) % len(motivational_quotes.MOTIVATIONAL_QUOTES)))
+        logger.info(f"Morning quote #{curr_idx + 1} sent to {sent_count} students successfully.")
+
+    return sent_count
+
 def generate_students_stats_report() -> str:
     students = database.list_students(config.DB_PATH)
     counts = database.get_student_count_by_stage(config.DB_PATH)
+    pkg4_count = database.get_stage_4_package_count(config.DB_PATH)
 
     s4 = counts.get(4, 0)
     total = len(students)
 
     report = (
-        "📊 **آمار و وضعیت دانش‌آموزان مشاوره:** 📈\n\n"
-        f"👥 کل دانش‌آموزان ثبت‌شده: {total} نفر\n"
-        f"🚀 وارد شده به فاز ۴: {s4} نفر\n\n"
+        "📊 **آمار و وضعیت دانش‌آموزان مشاوره:** 📈\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 کل دانش‌آموزان ثبت‌شده: **{total} نفر**\n"
+        f"🚀 وارد شده به فاز ۴: **{s4} نفر**\n"
+        f"📦 بسته‌های آموزشی آماده در بخش ۴: **{pkg4_count} بسته**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
         "📋 **لیست دانش‌آموزان:**\n"
     )
 
@@ -390,20 +499,47 @@ def generate_students_stats_report() -> str:
         report += "هنوز دانش‌آموزی ثبت‌نام نکرده است.\n"
         return report
 
-    now = datetime.utcnow()
+    now = database.get_now_utc()
     for idx, st in enumerate(students, start=1):
         disp_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         reg_str = st.get("registered_at")
         day_num = 1
         if reg_str:
-            try:
-                dt = datetime.fromisoformat(str(reg_str).replace("Z", ""))
+            dt = database.parse_db_datetime(reg_str)
+            if dt:
                 day_num = max(1, (now - dt).days + 1)
-            except Exception:
-                day_num = 1
-        report += f"{idx}. **{disp_name}** ⬅️ روز {day_num}\n"
+        safe_name = escape_md(disp_name)
+        report += f"{idx}. **{safe_name}** ⬅️ روز {day_num}\n"
 
     return report
+
+async def send_database_backup_file(bot, chat_id: int):
+    if not os.path.exists(config.DB_PATH):
+        await bot.send_message(chat_id=chat_id, text="⚠️ فایل دیتابیس هنوز ایجاد نشده است.")
+        return
+
+    backup_file = database.create_database_backup(config.DB_PATH)
+    now_str = get_iran_now().strftime("%Y-%m-%d_%H-%M")
+    try:
+        with open(backup_file, "rb") as f:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=f"backup_consulting_bot_{now_str}.db",
+                caption=(
+                    "💾 **نسخه پشتیبان کامل دیتابیس ربات** 📦\n\n"
+                    f"🗓 تاریخ بکاپ: `{now_str}`\n"
+                    "📌 **شامل:** کلیه اطلاعات دانش‌آموزان، مراحل، فایل‌های ذخیره‌شده و تنظیمات زمان‌بندی.\n\n"
+                    "💡 *در صورت نیاز به بازیابی اطلاعات (مثلاً پس از ویرایش و ری‌استارت رندر)، کافیست همین فایل `.db` را در پی‌وی برای ربات بفرستید.*"
+                ),
+                parse_mode="Markdown"
+            )
+    finally:
+        if os.path.exists(backup_file) and os.path.abspath(backup_file) != os.path.abspath(config.DB_PATH):
+            try:
+                os.remove(backup_file)
+            except Exception:
+                pass
 
 # --- Core Handlers ---
 
@@ -424,7 +560,8 @@ async def start_handler(update, context):
         )
         if success:
             display_name = assigned_name or user_name
-            salutation = f"سلام {display_name} عزیز 🌸"
+            safe_display_name = escape_md(display_name)
+            salutation = f"سلام {safe_display_name} عزیز 🌸"
             await update.message.reply_text(
                 f"✨ **{salutation}**\n\n"
                 "به ربات مشاوره تحصیلی دکتر هاشمی خوش آمدید 🌱🎓\n"
@@ -438,11 +575,11 @@ async def start_handler(update, context):
             # Alert admin that a student just joined and is now in their students list
             if config.ADMIN_ID and user_id != config.ADMIN_ID:
                 try:
-                    uname = f"@{username}" if username else "بدون یوزرنیم"
+                    uname = f"@{escape_md(username)}" if username else "بدون یوزرنیم"
                     await context.bot.send_message(
                         chat_id=config.ADMIN_ID,
                         text=f"🔔 **دانش‌آموز جدید ثبت‌نام شد:** 👤\n\n"
-                             f"• نام: **{display_name}** ({uname})\n"
+                             f"• نام: **{safe_display_name}** ({uname})\n"
                              "• کد دعوت با موفقیت فعال شد و این دانش‌آموز به لیست دانش‌آموزان شما اضافه گردید 🎯",
                         parse_mode="Markdown"
                     )
@@ -473,10 +610,11 @@ async def start_handler(update, context):
     if student:
         stage = student["current_stage"]
         name = student.get("assigned_name") or user_name
+        safe_name = escape_md(name)
         reply_kb = get_student_reply_keyboard(stage)
         if stage <= 3:
             await update.message.reply_text(
-                f"👋 **سلام مجدد {name} عزیز.** 🌱\n"
+                f"👋 **سلام مجدد {safe_name} عزیز.** 🌱\n"
                 f"شما در حال حاضر در **مرحله {stage}** هستید. محتوای این مرحله مجدداً برای شما ارسال می‌شود:",
                 parse_mode="Markdown",
                 reply_markup=reply_kb
@@ -548,13 +686,19 @@ async def admin_callback_handler(update, context):
         )
         await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_milestones_keyboard())
 
+    elif data == "admin_test_quote":
+        await query.message.reply_text("⏳ در حال آماده‌سازی و ارسال نمونه پیام انگیزشی ساعت ۷ صبح...")
+        await execute_morning_quotes_cycle(context.bot, target_user_id=user_id)
+        return
+
     elif data.startswith("admin_record_"):
         stage_num = int(data.split("_")[-1])
         active_states[user_id] = f"RECORD_STAGE_{stage_num}"
+        active_package_ids[user_id] = int(get_iran_now().timestamp())
         if stage_num <= 3:
             stage_title = f"مرحله {stage_num}"
         elif stage_num == 4:
-            stage_title = "بخش ۴ (مطالب مهم جدید)"
+            stage_title = "بخش ۴ (بسته آموزشی جدید)"
         elif stage_num == 8:
             stage_title = "محتوای روز هشتم مشاوره 🎯"
         elif stage_num == 30:
@@ -562,11 +706,17 @@ async def admin_callback_handler(update, context):
         else:
             stage_title = f"بخش {stage_num}"
 
+        note_text = (
+            "✨ *نکته هوشمند بخش ۴:* اگر یک ویدیو یا عکس همراه با ویس توضیحات دارید، همه را پشت سر هم بفرستید؛ ربات آنها را در قالب یک بسته پیوسته ذخیره کرده و در روز نوبت با هم به دانش‌آموز تحویل می‌دهد.\n\n"
+            if stage_num == 4 else ""
+        )
+
         await query.message.reply_text(
-            f"🎙 **حالت ذخیره‌سازی برای «{stage_title}» فعال شد.**\n\n"
-            "📥 هم‌اکنون پیام‌ها، ویس‌ها، متن‌ها و فایل‌ها را از گروه مشاوره به این چت فوروارد کنید.\n"
-            "هر پیامی بفرستید خودکار در آرشیو ثبت می‌شود 🟢\n"
-            "👇 پس از اتمام، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
+            f"🎙 **حالت ذخیره‌سازی برای «{stage_title}» فعال شد.**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📥 هم‌اکنون پیام‌ها، ویس‌ها، ویدیوها و فایل‌ها را به این چت فوروارد کنید.\n"
+            f"{note_text}"
+            "👇 پس از پایان ارسال فایل‌های این بسته، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
             parse_mode="Markdown",
             reply_markup=get_recording_reply_keyboard()
         )
@@ -686,6 +836,10 @@ async def admin_callback_handler(update, context):
         report = generate_students_stats_report()
         await query.message.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
 
+    elif data == "admin_download_db":
+        await query.message.reply_text("⏳ در حال تهیه نسخه پشتیبان کامل از دیتابیس...")
+        await send_database_backup_file(context.bot, user_id)
+
 # --- Student Callback Handler ---
 
 async def student_callback_handler(update, context):
@@ -757,6 +911,38 @@ async def message_collector(update, context):
     # 1. ADMIN ACTIONS & BUTTONS
     # ==========================
     if is_admin(user_id, username):
+        # Database restore document handler (Admin sends .db file)
+        if msg.document:
+            file_name = msg.document.file_name or ""
+            if file_name.lower().endswith(".db"):
+                await msg.reply_text("⏳ در حال دریافت و بررسی فایل دیتابیس برای بازیابی...")
+                try:
+                    doc_file = await msg.document.get_file()
+                    dir_name = os.path.dirname(config.DB_PATH) or "."
+                    temp_restore_path = os.path.join(dir_name, "temp_restore.db")
+                    await doc_file.download_to_drive(custom_path=temp_restore_path)
+
+                    success = database.restore_database_backup(temp_restore_path, config.DB_PATH)
+                    if os.path.exists(temp_restore_path):
+                        os.remove(temp_restore_path)
+
+                    if success:
+                        database.init_db(config.DB_PATH)
+                        st_count = len(database.list_students(config.DB_PATH))
+                        await msg.reply_text(
+                            "🎉 **دیتابیس با موفقیت کامل بازیابی شد!** 🟢✨\n\n"
+                            f"👥 تعداد دانش‌آموزان بازیابی‌شده: **{st_count} نفر**\n"
+                            "تمام مراحل، فایل‌های ذخیره‌شده و تنظیمات به طور کامل بازگردانده شدند 🚀",
+                            parse_mode="Markdown",
+                            reply_markup=get_admin_reply_keyboard()
+                        )
+                    else:
+                        await msg.reply_text("❌ خطا در بازیابی دیتابیس. فایل نامعتبر است.")
+                except Exception as e:
+                    logger.error(f"Error restoring db from document: {e}")
+                    await msg.reply_text(f"❌ خطا در پردازش فایل دیتابیس: {e}")
+                return
+
         state = active_states.get(user_id)
 
         # A) State: Waiting for student name
@@ -772,12 +958,13 @@ async def message_collector(update, context):
             bot_user = bot_info.username
             invite_link = f"https://t.me/{bot_user}?start={code}"
 
+            safe_name = escape_md(student_name)
             reply_text = (
-                f"🔗 **لینک دعوت اختصاصی برای «{student_name}» ساخته شد:**\n\n"
+                f"🔗 **لینک دعوت اختصاصی برای «{safe_name}» ساخته شد:**\n\n"
                 f"`{invite_link}`\n\n"
                 "📌 **نکات مهم:**\n"
-                f"• این لینک یکبارمصرف است و مختص **{student_name}** می‌باشد.\n"
-                f"• به محض باز کردن لینک، ربات با عبارت **«سلام {student_name} عزیز 🌸»** به او خوش‌آمد می‌گوید و به طور خودکار به لیست دانش‌آموزان شما اضافه خواهد شد."
+                f"• این لینک یکبارمصرف است و مختص **{safe_name}** می‌باشد.\n"
+                f"• به محض باز کردن لینک، ربات با عبارت **«سلام {safe_name} عزیز 🌸»** به او خوش‌آمد می‌گوید و به طور خودکار به لیست دانش‌آموزان شما اضافه خواهد شد."
             )
             await msg.reply_text(reply_text, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
             return
@@ -793,7 +980,8 @@ async def message_collector(update, context):
 
             database.create_study_plan(config.DB_PATH, target_uid, days)
             st = database.get_student(config.DB_PATH, target_uid)
-            name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+            raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+            name = escape_md(raw_name)
 
             await msg.reply_text(
                 f"✅ **برنامه {days} روزه با موفقیت برای «{name}» فعال شد!** 🎯\n"
@@ -817,31 +1005,66 @@ async def message_collector(update, context):
         if "اتمام ذخیره پیام‌ها" in text or "انصراف و بازگشت" in text:
             curr_state = active_states.get(user_id, "")
             active_states[user_id] = None
+            pkg_id = active_package_ids.pop(user_id, None)
             stage_num = int(curr_state.split("_")[-1]) if "RECORD_STAGE_" in curr_state else 1
-            count = len(database.get_stage_messages(config.DB_PATH, stage_num))
-            await msg.reply_text(
-                f"✅ **عملیات ثبت محتوا به پایان رسید.** 🟢\n"
-                f"مجموع پیام‌های ذخیره شده در این بخش: {count} پیام.\n\n"
-                "به منوی اصلی مدیریت بازگشتید:",
-                parse_mode="Markdown",
-                reply_markup=get_admin_reply_keyboard()
-            )
+
+            conn = database.get_connection(config.DB_PATH)
+            try:
+                cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
+                pkg_cnt = cur.fetchone()["cnt"] if pkg_id else 0
+            finally:
+                conn.close()
+
+            if stage_num == 4:
+                tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+                await msg.reply_text(
+                    "🎉 **بسته آموزشی بخش ۴ با موفقیت ذخیره شد!** 🟢✨\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 تعداد فایل‌های این بسته: **{pkg_cnt} فایل** (ویدیو/عکس + ویس)\n"
+                    f"📊 مجموع کل بسته‌های آماده بخش ۴: **{tot_pkg} بسته**\n\n"
+                    "💡 *در روز نوبت ارسال، تمامی فایل‌های این بسته به صورت خودکار، پشت سر هم و یکجا برای دانش‌آموز ارسال خواهد شد.* 🚀",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_reply_keyboard()
+                )
+            else:
+                count = len(database.get_stage_messages(config.DB_PATH, stage_num))
+                await msg.reply_text(
+                    f"✅ **عملیات ثبت محتوا برای مرحله {stage_num} به پایان رسید.** 🟢\n"
+                    f"مجموع پیام‌های ذخیره شده در این مرحله: {count} پیام.\n\n"
+                    "به منوی اصلی مدیریت بازگشتید:",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_reply_keyboard()
+                )
             return
 
         # D) State: Recording forwarded messages for a stage
         if state and state.startswith("RECORD_STAGE_"):
             stage_num = int(state.split("_")[-1])
+            pkg_id = active_package_ids.get(user_id)
+            if not pkg_id:
+                pkg_id = int(get_iran_now().timestamp())
+                active_package_ids[user_id] = pkg_id
+
             caption = msg.caption or (text[:50] if text else None)
             database.add_stage_message(
                 config.DB_PATH,
                 stage=stage_num,
                 from_chat_id=msg.chat_id,
                 message_id=msg.message_id,
-                caption=caption
+                caption=caption,
+                package_id=pkg_id
             )
-            count = len(database.get_stage_messages(config.DB_PATH, stage_num))
+
+            conn = database.get_connection(config.DB_PATH)
+            try:
+                cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
+                pkg_cnt = cur.fetchone()["cnt"]
+            finally:
+                conn.close()
+
             await msg.reply_text(
-                f"✅ فایل شماره {count} برای بخش {stage_num} ذخیره شد 🟢",
+                f"✅ فایل شماره {pkg_cnt} در این بسته آموزشی ذخیره شد 🟢\n"
+                "*(می‌توانید فایل‌های مکمل مثل ویدیو، عکس و ویس را در ادامه فوروارد کنید یا دکمه اتمام را بزنید)*",
                 parse_mode="Markdown",
                 reply_markup=get_recording_reply_keyboard()
             )
@@ -868,10 +1091,16 @@ async def message_collector(update, context):
 
         elif "افزودن فایل به بخش ۴" in text:
             active_states[user_id] = "RECORD_STAGE_4"
+            active_package_ids[user_id] = int(get_iran_now().timestamp())
             await msg.reply_text(
-                "🟣 🎙 **حالت ذخیره‌سازی برای «بخش ۴ (ویس‌های جدید)» فعال شد.** 💡\n\n"
-                "📥 ویس‌ها، فیلم‌ها و پیام‌های جدید را فوروارد کنید.\n"
-                "👇 پس از اتمام، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
+                "🟣 🎙 **حالت ذخیره‌سازی بسته جدید برای «بخش ۴» فعال شد.** 💡\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📥 اکنون می‌توانید فایل‌های این نوبت را فوروارد کنید:\n"
+                "• یک ویس تک و مجزا\n"
+                "• یا یک ویدیو همراه با ویس توضیحات\n"
+                "• یا یک تصویر همراه با ویس توضیحات\n\n"
+                "✨ *ربات به صورت خودکار تمام فایل‌هایی که اکنون بفرستید را در قالب یک بسته واحد متصل ذخیره می‌کند و در روز نوبت با هم به دانش‌آموز تحویل می‌دهد.*\n\n"
+                "👇 پس از ارسال فایل‌های این بسته، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
                 parse_mode="Markdown",
                 reply_markup=get_recording_reply_keyboard()
             )
@@ -920,6 +1149,16 @@ async def message_collector(update, context):
             await msg.reply_text(report, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
             return
 
+        elif "تست جمله انگیزشی" in text:
+            await msg.reply_text("⏳ در حال آماده‌سازی و ارسال نمونه پیام انگیزشی ساعت ۷ صبح...")
+            await execute_morning_quotes_cycle(context.bot, target_user_id=user_id)
+            return
+
+        elif "دریافت بکاپ دیتابیس" in text:
+            await msg.reply_text("⏳ در حال آماده‌سازی و ارسال نسخه پشتیبان دیتابیس...")
+            await send_database_backup_file(context.bot, user_id)
+            return
+
         elif "منوی اصلی مدیریت" in text:
             await msg.reply_text(
                 "👑 **منوی اصلی مدیریت ربات مشاوره دکتر هاشمی:**",
@@ -934,7 +1173,8 @@ async def message_collector(update, context):
     student = database.get_student(config.DB_PATH, user_id)
     if student:
         curr_stage = student["current_stage"]
-        name = student.get("assigned_name") or student.get("full_name") or "دانش‌آموز"
+        raw_name = student.get("assigned_name") or student.get("full_name") or "دانش‌آموز"
+        name = escape_md(raw_name)
 
         # A) State: Student typing their study report
         st_state = active_states.get(user_id)
@@ -942,6 +1182,8 @@ async def message_collector(update, context):
             active_states[user_id] = None
             report_result = database.submit_study_plan_report(config.DB_PATH, user_id, text)
             dur = report_result["duration_days"] if report_result else 7
+
+            safe_text = escape_md(text)
 
             await msg.reply_text(
                 f"✅ **{name} عزیز، گزارش مباحث با موفقیت برای دکتر هاشمی ارسال شد!** 🌱✨\n\n"
@@ -955,12 +1197,12 @@ async def message_collector(update, context):
             if admin_target:
                 report_alert = (
                     f"📩🔔 **گزارش مباحث خوانده‌شده از طرف «{name}»:**\n\n"
-                    f"📝 *متن گزارش:*\n{text}\n\n"
+                    f"📝 *متن گزارش:*\n{safe_text}\n\n"
                     f"🎯 *برنامه دوره قبلی:* {dur} روزه (تکمیل شد)\n"
                     "👇 جهت تایید و فعال‌سازی برنامه دوره جدید، دکمه زیر را لمس کنید:"
                 )
                 admin_kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"➕ تنظیم برنامه دوره جدید برای {name}", callback_data=f"plan_user_{user_id}", style="success")
+                    InlineKeyboardButton(f"➕ تنظیم برنامه دوره جدید برای {raw_name}", callback_data=f"plan_user_{user_id}", style="success")
                 ]])
                 try:
                     await context.bot.send_message(chat_id=admin_target, text=report_alert, parse_mode="Markdown", reply_markup=admin_kb)
@@ -1033,9 +1275,16 @@ async def drip_scheduler_loop(app):
     while True:
         try:
             now_iran = get_iran_now()
-            target_hour = int(database.get_setting(config.DB_PATH, "drip_send_hour", "23"))
-
             today_str = now_iran.strftime("%Y-%m-%d")
+
+            # 1. Daily 7:00 AM Morning Motivational Quotes Check
+            if now_iran.hour == 7:
+                quotes_sent = await execute_morning_quotes_cycle(app.bot)
+                if quotes_sent > 0:
+                    logger.info(f"Daily 7:00 AM motivational quotes delivered to {quotes_sent} students.")
+
+            # 2. Daily Nightly Drip & Milestones Check (Default 23:00)
+            target_hour = int(database.get_setting(config.DB_PATH, "drip_send_hour", "23"))
             if now_iran.hour == target_hour and last_run_day != today_str:
                 logger.info(f"Target hour {target_hour}:00 reached in Iran. Running daily scheduled deliveries...")
                 milestones_sent = await execute_milestones_check(app.bot)
@@ -1043,10 +1292,20 @@ async def drip_scheduler_loop(app):
                 last_run_day = today_str
                 logger.info(f"Daily cycle finished. Milestones: {milestones_sent}, Drip: {drip_sent}")
 
+                # Auto-backup database daily to admin
+                if config.ADMIN_ID:
+                    try:
+                        await send_database_backup_file(app.bot, config.ADMIN_ID)
+                        logger.info("Sent daily auto-backup database file to admin.")
+                    except Exception as e:
+                        logger.warning(f"Could not send daily backup to admin: {e}")
+
+            # 3. Hourly Study Plans Reminders
             plan_reminders = await execute_study_plans_reminders(app.bot)
             if plan_reminders > 0:
                 logger.info(f"Sent {plan_reminders} study plan 1-day reminders.")
 
+            # 4. Inactivity Warnings (every loop check)
             inactivity_warns = await execute_inactivity_warnings(app.bot)
             if inactivity_warns > 0:
                 logger.info(f"Sent {inactivity_warns} 2-day inactivity warnings to students.")
@@ -1054,7 +1313,7 @@ async def drip_scheduler_loop(app):
         except Exception as e:
             logger.error(f"Error in drip_scheduler_loop: {e}")
 
-        await asyncio.sleep(600)
+        await asyncio.sleep(60)
 
 # --- Application Setup ---
 
