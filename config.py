@@ -4,11 +4,14 @@ import os
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
 # Telegram numeric ID for the admin/consultant
-raw_admin_id = os.getenv("ADMIN_ID", "0")
+raw_admin_id = os.getenv("ADMIN_ID", "1176839639")
 try:
     ADMIN_ID: int = int(raw_admin_id)
 except ValueError:
-    ADMIN_ID: int = 0
+    ADMIN_ID: int = 1176839639
+
+# Telegram username for the admin/consultant
+ADMIN_USERNAME: str = os.getenv("ADMIN_USERNAME", "Hojjat_hshmi")
 
 # Database file path
 DB_PATH: str = os.getenv("DB_PATH", "consulting_bot.db")
