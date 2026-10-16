@@ -95,48 +95,48 @@ def get_student_reply_keyboard(current_stage: int = 1):
 
 def get_admin_main_inline_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🟢 🔗 ساخت لینک اختصاصی (با نام) 👤", callback_data="admin_ask_name")],
-        [InlineKeyboardButton("🔵 📁 مدیریت و بارگذاری محتوای مراحل 📥", callback_data="admin_manage_stages")],
-        [InlineKeyboardButton("🟣 🎙 افزودن ویس به بخش ۴ 💡", callback_data="admin_record_4")],
-        [InlineKeyboardButton("🟠 🎯 تنظیم محتوای روز ۸ و ۳۰ 🏆", callback_data="admin_milestones_menu")],
-        [InlineKeyboardButton("🟡 🗓 برنامه‌ریزی درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯", callback_data="admin_plans_menu")],
-        [InlineKeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار بخش ۴ ⚙️", callback_data="admin_drip_settings")],
-        [InlineKeyboardButton("📊 📈 لیست و وضعیت دقیق دانش‌آموزان 📈", callback_data="admin_stats")],
+        [InlineKeyboardButton("🟢 🔗 ساخت لینک اختصاصی (با نام) 👤", callback_data="admin_ask_name", style="success")],
+        [InlineKeyboardButton("🔵 📁 مدیریت و بارگذاری محتوای مراحل 📥", callback_data="admin_manage_stages", style="primary")],
+        [InlineKeyboardButton("🟣 🎙 افزودن ویس به بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
+        [InlineKeyboardButton("🟠 🎯 تنظیم محتوای روز ۸ و ۳۰ 🏆", callback_data="admin_milestones_menu", style="primary")],
+        [InlineKeyboardButton("🟡 🗓 برنامه‌ریزی درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯", callback_data="admin_plans_menu", style="primary")],
+        [InlineKeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار بخش ۴ ⚙️", callback_data="admin_drip_settings", style="primary")],
+        [InlineKeyboardButton("📊 📈 لیست و وضعیت دقیق دانش‌آموزان 📈", callback_data="admin_stats", style="success")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_stages_selection_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🟢 📥 بارگذاری مرحله ۱ 🎓", callback_data="admin_record_1")],
-        [InlineKeyboardButton("🔵 📥 بارگذاری مرحله ۲ 📚", callback_data="admin_record_2")],
-        [InlineKeyboardButton("🟣 📥 بارگذاری مرحله ۳ 🧠", callback_data="admin_record_3")],
-        [InlineKeyboardButton("🟠 🎙 بارگذاری فایل‌های بخش ۴ 💡", callback_data="admin_record_4")],
-        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu")],
+        [InlineKeyboardButton("🟢 📥 بارگذاری مرحله ۱ 🎓", callback_data="admin_record_1", style="success")],
+        [InlineKeyboardButton("🔵 📥 بارگذاری مرحله ۲ 📚", callback_data="admin_record_2", style="primary")],
+        [InlineKeyboardButton("🟣 📥 بارگذاری مرحله ۳ 🧠", callback_data="admin_record_3", style="primary")],
+        [InlineKeyboardButton("🟠 🎙 بارگذاری فایل‌های بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
+        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_milestones_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🎯 📥 بارگذاری محتوای روز ۸ مشاوره 🎯", callback_data="admin_record_8")],
-        [InlineKeyboardButton("🏆 📥 بارگذاری محتوای روز ۳۰ مشاوره 🏆", callback_data="admin_record_30")],
-        [InlineKeyboardButton("⚡️ 🚀 ارسال فوری نوبت‌های روز ۸ و ۳۰ ⚡️", callback_data="admin_force_milestones")],
-        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu")],
+        [InlineKeyboardButton("🎯 📥 بارگذاری محتوای روز ۸ مشاوره 🎯", callback_data="admin_record_8", style="primary")],
+        [InlineKeyboardButton("🏆 📥 بارگذاری محتوای روز ۳۰ مشاوره 🏆", callback_data="admin_record_30", style="primary")],
+        [InlineKeyboardButton("⚡️ 🚀 ارسال فوری نوبت‌های روز ۸ و ۳۰ ⚡️", callback_data="admin_force_milestones", style="success")],
+        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_drip_settings_keyboard(interval_days: int, hour: int):
     keyboard = [
-        [InlineKeyboardButton("⚡️ 🚀 ارسال نوبت امروز (اجرای دستی) ⚡️", callback_data="admin_force_drip")],
+        [InlineKeyboardButton("⚡️ 🚀 ارسال نوبت امروز (اجرای دستی) ⚡️", callback_data="admin_force_drip", style="success")],
         [
-            InlineKeyboardButton(f"هر ۱ روز {'✅' if interval_days == 1 else ''}", callback_data="drip_set_int_1"),
-            InlineKeyboardButton(f"هر ۲ روز {'✅' if interval_days == 2 else ''}", callback_data="drip_set_int_2"),
-            InlineKeyboardButton(f"هر ۳ روز {'✅' if interval_days == 3 else ''}", callback_data="drip_set_int_3"),
+            InlineKeyboardButton(f"هر ۱ روز {'✅' if interval_days == 1 else ''}", callback_data="drip_set_int_1", style="primary"),
+            InlineKeyboardButton(f"هر ۲ روز {'✅' if interval_days == 2 else ''}", callback_data="drip_set_int_2", style="primary"),
+            InlineKeyboardButton(f"هر ۳ روز {'✅' if interval_days == 3 else ''}", callback_data="drip_set_int_3", style="primary"),
         ],
         [
-            InlineKeyboardButton(f"ساعت ۱۰ شب (۲۲){' ✅' if hour == 22 else ''}", callback_data="drip_set_hour_22"),
-            InlineKeyboardButton(f"ساعت ۱۱ شب (۲۳){' ✅' if hour == 23 else ''}", callback_data="drip_set_hour_23"),
+            InlineKeyboardButton(f"ساعت ۱۰ شب (۲۲){' ✅' if hour == 22 else ''}", callback_data="drip_set_hour_22", style="primary"),
+            InlineKeyboardButton(f"ساعت ۱۱ شب (۲۳){' ✅' if hour == 23 else ''}", callback_data="drip_set_hour_23", style="primary"),
         ],
-        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی مدیریت 🏠", callback_data="admin_menu")]
+        [InlineKeyboardButton("🔴 🔙 بازگشت به منوی مدیریت 🏠", callback_data="admin_menu", style="danger")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -146,24 +146,24 @@ def get_student_list_for_plans_keyboard(students: list):
     for st in students:
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         uid = st["user_id"]
-        row.append(InlineKeyboardButton(f"👤 {name}", callback_data=f"plan_user_{uid}"))
+        row.append(InlineKeyboardButton(f"👤 {name}", callback_data=f"plan_user_{uid}", style="primary"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu")])
+    keyboard.append([InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_plan_duration_keyboard(target_user_id: int):
     keyboard = [
         [
-            InlineKeyboardButton("🟢 🗓 برنامه ۷ روزه 🎯", callback_data=f"plan_set_{target_user_id}_7"),
-            InlineKeyboardButton("🔵 🗓 برنامه ۸ روزه 🎯", callback_data=f"plan_set_{target_user_id}_8"),
-            InlineKeyboardButton("🟣 🗓 برنامه ۹ روزه 🎯", callback_data=f"plan_set_{target_user_id}_9"),
+            InlineKeyboardButton("🟢 🗓 برنامه ۷ روزه 🎯", callback_data=f"plan_set_{target_user_id}_7", style="success"),
+            InlineKeyboardButton("🔵 🗓 برنامه ۸ روزه 🎯", callback_data=f"plan_set_{target_user_id}_8", style="primary"),
+            InlineKeyboardButton("🟣 🗓 برنامه ۹ روزه 🎯", callback_data=f"plan_set_{target_user_id}_9", style="primary"),
         ],
-        [InlineKeyboardButton("🟠 ✏️ تعداد روز دلخواه (دستی)", callback_data=f"plan_custom_{target_user_id}")],
-        [InlineKeyboardButton("🔴 🔙 بازگشت به لیست دانش‌آموزان 👥", callback_data="admin_plans_menu")]
+        [InlineKeyboardButton("🟠 ✏️ تعداد روز دلخواه (دستی)", callback_data=f"plan_custom_{target_user_id}", style="primary")],
+        [InlineKeyboardButton("🔴 🔙 بازگشت به لیست دانش‌آموزان 👥", callback_data="admin_plans_menu", style="danger")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -204,7 +204,7 @@ async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, 
             logger.warning(f"Failed to copy message {item.get('message_id')} for stage {stage}: {e}")
 
     btn_text = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_stage} ➡️" if next_stage <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
-    inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}")]])
+    inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}", style="success")]])
 
     await bot.send_message(
         chat_id=chat_id,
@@ -307,7 +307,7 @@ async def execute_study_plans_reminders(bot) -> int:
             "👇 *برای ارسال گزارش، دکمه زیر را لمس کرده و متنتان را بفرستید:*"
         )
         report_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟣 📝 ارسال لیست مباحث خوانده‌شده 📩", callback_data="student_start_report")
+            InlineKeyboardButton("🟣 📝 ارسال لیست مباحث خوانده‌شده 📩", callback_data="student_start_report", style="primary")
         ]])
 
         try:
@@ -352,8 +352,8 @@ async def execute_inactivity_warnings(bot) -> int:
 
         btn_text = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_stage} ➡️" if next_stage <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}")],
-            [InlineKeyboardButton(f"🔵 🔄 ارسال مجدد ویس‌های مرحله {stage} 🔁", callback_data=f"student_resend_stage_{stage}")]
+            [InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}", style="success")],
+            [InlineKeyboardButton(f"🔵 🔄 ارسال مجدد ویس‌های مرحله {stage} 🔁", callback_data=f"student_resend_stage_{stage}", style="primary")]
         ])
 
         try:
@@ -960,7 +960,7 @@ async def message_collector(update, context):
                     "👇 جهت تایید و فعال‌سازی برنامه دوره جدید، دکمه زیر را لمس کنید:"
                 )
                 admin_kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"➕ تنظیم برنامه دوره جدید برای {name}", callback_data=f"plan_user_{user_id}")
+                    InlineKeyboardButton(f"➕ تنظیم برنامه دوره جدید برای {name}", callback_data=f"plan_user_{user_id}", style="success")
                 ]])
                 try:
                     await context.bot.send_message(chat_id=admin_target, text=report_alert, parse_mode="Markdown", reply_markup=admin_kb)
