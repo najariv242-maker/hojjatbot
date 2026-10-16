@@ -75,7 +75,7 @@ def is_admin(user_id: int, username: Optional[str]) -> bool:
 
 def get_admin_reply_keyboard():
     keyboard = [
-        [KeyboardButton("🟢 🔗 ساخت لینک جدید (با نام) 👤"), KeyboardButton("🔵 📁 بارگذاری محتوای مراحل 📥")],
+        [KeyboardButton("🟢 🔗 ساخت لینک جدید (با نام) 👤"), KeyboardButton("📁 🗂 مدیریت و مشاهده محتوای مراحل 📥")],
         [KeyboardButton("🟣 🎙 افزودن فایل به بخش ۴ 💡"), KeyboardButton("🟠 🎯 محتوای روز ۸ و ۳۰ 🏆")],
         [KeyboardButton("🟡 🗓 برنامه درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯"), KeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار ⚙️")],
         [KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈"), KeyboardButton("☀️ 💬 تست جمله انگیزشی ۷ صبح")],
@@ -120,13 +120,66 @@ def get_admin_main_inline_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_stages_selection_keyboard():
+def get_stage_display_name(stage_num: int) -> str:
+    if stage_num == 1:
+        return "مرحله ۱ 🎓"
+    elif stage_num == 2:
+        return "مرحله ۲ 📚"
+    elif stage_num == 3:
+        return "مرحله ۳ 🧠"
+    elif stage_num == 4:
+        return "بخش ۴ (آموزش‌های دوره‌ای) 💡"
+    elif stage_num == 8:
+        return "محتوای روز ۸ مشاوره 🎯"
+    elif stage_num == 30:
+        return "محتوای روز ۳۰ مشاوره 🏆"
+    return f"مرحله {stage_num}"
+
+def get_stages_management_keyboard():
+    c1 = len(database.get_stage_messages(config.DB_PATH, 1))
+    c2 = len(database.get_stage_messages(config.DB_PATH, 2))
+    c3 = len(database.get_stage_messages(config.DB_PATH, 3))
+    pkg4 = database.get_stage_4_package_count(config.DB_PATH)
+    c4 = len(database.get_stage_messages(config.DB_PATH, 4))
+    c8 = len(database.get_stage_messages(config.DB_PATH, 8))
+    c30 = len(database.get_stage_messages(config.DB_PATH, 30))
+
     keyboard = [
-        [InlineKeyboardButton("🟢 📥 بارگذاری مرحله ۱ 🎓", callback_data="admin_record_1", style="success")],
-        [InlineKeyboardButton("🔵 📥 بارگذاری مرحله ۲ 📚", callback_data="admin_record_2", style="primary")],
-        [InlineKeyboardButton("🟣 📥 بارگذاری مرحله ۳ 🧠", callback_data="admin_record_3", style="primary")],
-        [InlineKeyboardButton("🟠 🎙 بارگذاری فایل‌های بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
+        [InlineKeyboardButton(f"🟢 🎓 مرحله ۱ ({c1} فایل ذخیره)", callback_data="stage_detail_1", style="success")],
+        [InlineKeyboardButton(f"🔵 📚 مرحله ۲ ({c2} فایل ذخیره)", callback_data="stage_detail_2", style="primary")],
+        [InlineKeyboardButton(f"🟣 🧠 مرحله ۳ ({c3} فایل ذخیره)", callback_data="stage_detail_3", style="primary")],
+        [InlineKeyboardButton(f"🟠 💡 بخش ۴ ({pkg4} بسته | {c4} فایل)", callback_data="stage_detail_4", style="primary")],
+        [
+            InlineKeyboardButton(f"🎯 روز ۸ ({c8} فایل)", callback_data="stage_detail_8", style="primary"),
+            InlineKeyboardButton(f"🏆 روز ۳۰ ({c30} فایل)", callback_data="stage_detail_30", style="primary"),
+        ],
         [InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stages_selection_keyboard():
+    return get_stages_management_keyboard()
+
+def get_stage_action_keyboard(stage_num: int, has_content: bool = True):
+    keyboard = []
+    if has_content:
+        keyboard.append([InlineKeyboardButton("👁 📥 مشاهده و پیش‌نمایش فایل‌ها (ارسال در چت)", callback_data=f"stage_preview_{stage_num}", style="success")])
+
+    if stage_num == 4:
+        keyboard.append([InlineKeyboardButton("➕ 🎙 افزودن بسته آموزشی جدید (ویدیو/عکس + ویس)", callback_data="admin_record_4", style="primary")])
+    else:
+        keyboard.append([InlineKeyboardButton("➕ 🎙 افزودن فایل جدید به این مرحله", callback_data=f"admin_record_{stage_num}", style="primary")])
+
+    if has_content:
+        keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی و حذف کامل محتوای این مرحله", callback_data=f"stage_clear_ask_{stage_num}", style="danger")])
+
+    keyboard.append([InlineKeyboardButton("🔙 📁 بازگشت به لیست مراحل", callback_data="admin_manage_stages", style="primary")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stage_clear_confirm_keyboard(stage_num: int):
+    keyboard = [
+        [InlineKeyboardButton("🔴 بله، حذف و پاکسازی کامل شود 🗑", callback_data=f"stage_clear_do_{stage_num}", style="danger")],
+        [InlineKeyboardButton("🟢 خیر، انصراف و بازگشت 🔙", callback_data=f"stage_detail_{stage_num}", style="success")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -670,9 +723,113 @@ async def admin_callback_handler(update, context):
 
     elif data == "admin_manage_stages":
         await query.message.reply_text(
-            "📁 **مرحله مورد نظر برای بارگذاری محتوا را انتخاب کنید:**",
+            "🗂 **مدیریت و مشاهده محتوای مراحل:** 📁\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "جهت مشاهده فایل‌های ذخیره‌شده هر مرحله، افزودن فایل جدید یا پاکسازی، مرحله مورد نظر را انتخاب کنید:",
             parse_mode="Markdown",
-            reply_markup=get_stages_selection_keyboard()
+            reply_markup=get_stages_management_keyboard()
+        )
+
+    elif data.startswith("stage_detail_"):
+        stage_num = int(data.split("_")[-1])
+        st_title = get_stage_display_name(stage_num)
+        msgs = database.get_stage_messages(config.DB_PATH, stage_num)
+        count = len(msgs)
+        if stage_num == 4:
+            pkg_count = database.get_stage_4_package_count(config.DB_PATH)
+            detail_txt = (
+                f"🗂 **مدیریت و وضعیت محتوای «{st_title}»**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 تعداد کل بسته‌های آموزشی: **{pkg_count} بسته**\n"
+                f"📎 مجموع فایل‌های ثبت‌شده: **{count} فایل** (ویدیو/عکس/ویس)\n\n"
+                "👇 یکی از گزینه‌های زیر را انتخاب نمایید:"
+            )
+        else:
+            detail_txt = (
+                f"🗂 **مدیریت و وضعیت محتوای «{st_title}»**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📎 تعداد فایل‌های ثبت‌شده در این مرحله: **{count} پیام**\n\n"
+                "👇 یکی از گزینه‌های زیر را انتخاب نمایید:"
+            )
+        await query.message.reply_text(
+            detail_txt,
+            parse_mode="Markdown",
+            reply_markup=get_stage_action_keyboard(stage_num, has_content=(count > 0))
+        )
+
+    elif data.startswith("stage_preview_"):
+        stage_num = int(data.split("_")[-1])
+        st_title = get_stage_display_name(stage_num)
+        msgs = database.get_stage_messages(config.DB_PATH, stage_num)
+        if not msgs:
+            await query.message.reply_text(
+                f"ℹ️ در حال حاضر هیچ فایلی برای **{st_title}** ذخیره نشده است.",
+                parse_mode="Markdown",
+                reply_markup=get_stage_action_keyboard(stage_num, has_content=False)
+            )
+            return
+
+        await query.message.reply_text(
+            f"⏳ در حال استخراج و ارسال پیش‌نمایش فایل‌های **{st_title}** ({len(msgs)} فایل)...",
+            parse_mode="Markdown"
+        )
+
+        if stage_num == 4:
+            packages = database.get_stage_packages(config.DB_PATH, 4)
+            for idx, pkg in enumerate(packages, 1):
+                await query.message.reply_text(
+                    f"📦 **بسته آموزشی شماره {idx}:** ({len(pkg)} فایل)",
+                    parse_mode="Markdown"
+                )
+                for m in pkg:
+                    try:
+                        await context.bot.copy_message(
+                            chat_id=user_id,
+                            from_chat_id=m["from_chat_id"],
+                            message_id=m["message_id"]
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.warning(f"Could not copy stage message {m['id']}: {e}")
+        else:
+            for m in msgs:
+                try:
+                    await context.bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=m["from_chat_id"],
+                        message_id=m["message_id"]
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Could not copy stage message {m['id']}: {e}")
+
+        await query.message.reply_text(
+            f"✅ **پیش‌نمایش تمامی فایل‌های «{st_title}» با موفقیت ارسال شد.** 🟢\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "برای افزودن یا تغییر محتوا از دکمه‌های زیر استفاده کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_stage_action_keyboard(stage_num, has_content=True)
+        )
+
+    elif data.startswith("stage_clear_ask_"):
+        stage_num = int(data.split("_")[-1])
+        st_title = get_stage_display_name(stage_num)
+        await query.message.reply_text(
+            f"⚠️ **آیا مطمئن هستید که می‌خواهید تمام فایل‌های «{st_title}» را حذف و پاکسازی کنید؟**\n\n"
+            "📌 *پس از حذف، این محتوا دیگر برای دانش‌آموزان جدید ارسال نخواهد شد و باید محتوای جدید برای این مرحله بارگذاری کنید.*",
+            parse_mode="Markdown",
+            reply_markup=get_stage_clear_confirm_keyboard(stage_num)
+        )
+
+    elif data.startswith("stage_clear_do_"):
+        stage_num = int(data.split("_")[-1])
+        st_title = get_stage_display_name(stage_num)
+        deleted = database.clear_stage_messages(config.DB_PATH, stage_num)
+        await query.message.reply_text(
+            f"🗑 **تمام محتوای «{st_title}» ({deleted} فایل) با موفقیت پاک شد.** 🟢\n\n"
+            "اکنون می‌توانید با زدن دکمه زیر، فایل‌های جدید را برای این مرحله بارگذاری کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_stage_action_keyboard(stage_num, has_content=False)
         )
 
     elif data == "admin_milestones_menu":
@@ -1081,11 +1238,13 @@ async def message_collector(update, context):
             )
             return
 
-        elif "بارگذاری محتوای مراحل" in text:
+        elif any(k in text for k in ("مدیریت و مشاهده", "بارگذاری محتوا", "محتوای مراحل", "مدیریت مراحل")):
             await msg.reply_text(
-                "🔵 📁 **مرحله مورد نظر برای بارگذاری محتوا را انتخاب کنید:**",
+                "🗂 **مدیریت و مشاهده محتوای مراحل:** 📁\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "جهت مشاهده فایل‌های ذخیره‌شده هر مرحله، افزودن فایل جدید یا پاکسازی، مرحله مورد نظر را انتخاب کنید:",
                 parse_mode="Markdown",
-                reply_markup=get_stages_selection_keyboard()
+                reply_markup=get_stages_management_keyboard()
             )
             return
 

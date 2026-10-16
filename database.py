@@ -356,6 +356,39 @@ def get_stage_4_package_count(db_path: str) -> int:
     finally:
         conn.close()
 
+def clear_stage_messages(db_path: str, stage: int) -> int:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM stage_messages WHERE stage = ?", (stage,))
+            return cur.rowcount
+    finally:
+        conn.close()
+
+def get_stage_packages(db_path: str, stage: int = 4) -> List[List[Dict[str, Any]]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT id, stage, from_chat_id, message_id, caption, package_id, created_at "
+            "FROM stage_messages WHERE stage = ? ORDER BY id ASC",
+            (stage,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        packages: List[List[Dict[str, Any]]] = []
+        pkg_map: Dict[Any, List[Dict[str, Any]]] = {}
+        order: List[Any] = []
+        for r in rows:
+            pid = r.get("package_id") or r["id"]
+            if pid not in pkg_map:
+                pkg_map[pid] = []
+                order.append(pid)
+            pkg_map[pid].append(r)
+        for pid in order:
+            packages.append(pkg_map[pid])
+        return packages
+    finally:
+        conn.close()
+
 def list_students(db_path: str) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
