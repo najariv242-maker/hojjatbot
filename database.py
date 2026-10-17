@@ -102,9 +102,26 @@ def init_db(db_path: str) -> None:
                 "status TEXT DEFAULT 'ACTIVE',"
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
+                "CREATE TABLE IF NOT EXISTS intro_contents ("
+                "id INTEGER PRIMARY KEY CHECK (id = 1),"
+                "from_chat_id INTEGER NULL,"
+                "message_id INTEGER NULL,"
+                "caption TEXT NULL,"
+                "text_content TEXT NULL,"
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ");"
+                "CREATE TABLE IF NOT EXISTS delivered_messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "user_id INTEGER NOT NULL,"
+                "stage INTEGER NOT NULL,"
+                "message_record_id INTEGER NOT NULL,"
+                "delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(user_id, message_record_id)"
+                ");"
                 "CREATE INDEX IF NOT EXISTS idx_stage ON stage_messages(stage);"
                 "CREATE INDEX IF NOT EXISTS idx_stage_pkg ON stage_messages(stage, package_id);"
                 "CREATE INDEX IF NOT EXISTS idx_delivered_package ON delivered_drip_messages(user_id, package_id);"
+                "CREATE INDEX IF NOT EXISTS idx_deliv_stage_msg ON delivered_messages(user_id, stage, message_record_id);"
                 "CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans(user_id);"
             )
 
@@ -246,7 +263,7 @@ def update_student_stage(db_path: str, user_id: int, new_stage: int) -> None:
     finally:
         conn.close()
 
-def get_students_due_for_inactivity_warning(db_path: str, threshold_days: float = 2.0) -> List[Dict[str, Any]]:
+def get_students_due_for_inactivity_warning(db_path: str) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
@@ -264,8 +281,12 @@ def get_students_due_for_inactivity_warning(db_path: str, threshold_days: float 
             st_dt = parse_db_datetime(st_time)
             if not st_dt:
                 continue
-            diff_days = (now - st_dt).total_seconds() / 86400.0
-            if diff_days >= threshold_days:
+            diff_hours = (now - st_dt).total_seconds() / 3600.0
+            stage = st.get("current_stage", 1)
+            # Stage 1: 18 hours; Stage 2 & 3: 24 hours
+            threshold_hours = 18.0 if stage == 1 else 24.0
+            if diff_hours >= threshold_hours:
+                st["hours_waiting"] = diff_hours
                 due.append(st)
         return due
     finally:
@@ -619,4 +640,108 @@ def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
             dst.close()
         if src:
             src.close()
+
+# --- Intro / Rules (Red Lines) Content ---
+
+def set_intro_content(db_path: str, from_chat_id: Optional[int] = None, message_id: Optional[int] = None, caption: Optional[str] = None, text_content: Optional[str] = None) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, text_content, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "from_chat_id = excluded.from_chat_id, "
+                "message_id = excluded.message_id, "
+                "caption = excluded.caption, "
+                "text_content = excluded.text_content, "
+                "updated_at = excluded.updated_at",
+                (from_chat_id, message_id, caption, text_content, get_now_utc())
+            )
+    finally:
+        conn.close()
+
+def get_intro_content(db_path: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT id, from_chat_id, message_id, caption, text_content, updated_at FROM intro_contents WHERE id = 1")
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def clear_intro_content(db_path: str) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM intro_contents WHERE id = 1")
+    finally:
+        conn.close()
+
+# --- Generic Stage Delivered Message Tracking (Duplicate Prevention) ---
+
+def record_message_delivery(db_path: str, user_id: int, stage: int, message_record_id: int) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO delivered_messages (user_id, stage, message_record_id, delivered_at) VALUES (?, ?, ?, ?)",
+                (user_id, stage, message_record_id, get_now_utc())
+            )
+    finally:
+        conn.close()
+
+def is_message_delivered(db_path: str, user_id: int, message_record_id: int) -> bool:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM delivered_messages WHERE user_id = ? AND message_record_id = ? LIMIT 1",
+            (user_id, message_record_id)
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+# --- Section 4 Specific Package Queries ---
+
+def get_stage_4_packages_summary(db_path: str) -> List[Dict[str, Any]]:
+    packages = get_stage_packages(db_path, stage=4)
+    summary = []
+    for idx, pkg in enumerate(packages, 1):
+        pid = pkg[0].get("package_id") or pkg[0]["id"]
+        summary.append({
+            "index": idx,
+            "package_id": pid,
+            "count": len(pkg),
+            "is_package": len(pkg) > 1,
+            "caption": pkg[0].get("caption") or "",
+            "messages": pkg
+        })
+    return summary
+
+def get_students_missing_stage_4_package(db_path: str, package_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT user_id, username, full_name, assigned_name FROM students "
+            "WHERE current_stage >= 4 "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM delivered_drip_messages "
+            "    WHERE user_id = students.user_id AND package_id = ?"
+            "  )",
+            (package_id,)
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def split_stage_4_messages_to_solo(db_path: str) -> int:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("UPDATE stage_messages SET package_id = id WHERE stage = 4")
+            return cur.rowcount
+    finally:
+        conn.close()
+
 

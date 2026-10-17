@@ -4,7 +4,7 @@ import logging
 import secrets
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List, Tuple
 
 import config
 import database
@@ -16,9 +16,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Active states: "AWAITING_STUDENT_NAME", "RECORD_STAGE_...", "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT"
+# Active states: "AWAITING_STUDENT_NAME", "RECORD_STAGE_...", "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT", "AWAITING_INTRO_CONTENT", "AWAITING_BROADCAST_CONTENT"
 active_states: Dict[int, Optional[str]] = {}
 active_package_ids: Dict[int, int] = {}
+pending_broadcast: Dict[int, Dict[str, Any]] = {}
 
 try:
     from telegram import (
@@ -76,7 +77,8 @@ def is_admin(user_id: int, username: Optional[str]) -> bool:
 def get_admin_reply_keyboard():
     keyboard = [
         [KeyboardButton("🟢 🔗 ساخت لینک جدید (با نام) 👤"), KeyboardButton("📁 🗂 مدیریت و مشاهده محتوای مراحل 📥")],
-        [KeyboardButton("🟣 🎙 افزودن فایل به بخش ۴ 💡"), KeyboardButton("🟠 🎯 محتوای روز ۸ و ۳۰ 🏆")],
+        [KeyboardButton("🟣 🎙 افزودن فایل به بخش ۴ 💡"), KeyboardButton("📢 📨 ارسال پیام همگانی (پین‌دار) 📌")],
+        [KeyboardButton("📜 📌 پیام خوش‌آمد و خط قرمزها"), KeyboardButton("🟠 🎯 محتوای روز ۸ و ۳۰ 🏆")],
         [KeyboardButton("🟡 🗓 برنامه درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯"), KeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار ⚙️")],
         [KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈"), KeyboardButton("☀️ 💬 تست جمله انگیزشی ۷ صبح")],
         [KeyboardButton("💾 دریافت بکاپ دیتابیس 📦"), KeyboardButton("👑 🏠 منوی اصلی مدیریت 👑")]
@@ -110,7 +112,9 @@ def get_admin_main_inline_keyboard():
     keyboard = [
         [InlineKeyboardButton("🟢 🔗 ساخت لینک اختصاصی (با نام) 👤", callback_data="admin_ask_name", style="success")],
         [InlineKeyboardButton("🔵 📁 مدیریت و بارگذاری محتوای مراحل 📥", callback_data="admin_manage_stages", style="primary")],
-        [InlineKeyboardButton("🟣 🎙 افزودن بسته آموزشی به بخش ۴ 💡", callback_data="admin_record_4", style="primary")],
+        [InlineKeyboardButton("🟣 🎙 مدیریت و افزودن فایل به بخش ۴ 💡", callback_data="admin_record_4_menu", style="primary")],
+        [InlineKeyboardButton("📢 📨 ارسال پیام همگانی برای همه (با پین) 📌", callback_data="admin_broadcast_menu", style="primary")],
+        [InlineKeyboardButton("📜 📌 تنظیم پیام خوش‌آمد و خط قرمزها", callback_data="admin_intro_menu", style="primary")],
         [InlineKeyboardButton("🟠 🎯 تنظیم محتوای روز ۸ و ۳۰ 🏆", callback_data="admin_milestones_menu", style="primary")],
         [InlineKeyboardButton("🟡 🗓 برنامه‌ریزی درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯", callback_data="admin_plans_menu", style="primary")],
         [InlineKeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار بخش ۴ ⚙️", callback_data="admin_drip_settings", style="primary")],
@@ -148,7 +152,7 @@ def get_stages_management_keyboard():
         [InlineKeyboardButton(f"🟢 🎓 مرحله ۱ ({c1} فایل ذخیره)", callback_data="stage_detail_1", style="success")],
         [InlineKeyboardButton(f"🔵 📚 مرحله ۲ ({c2} فایل ذخیره)", callback_data="stage_detail_2", style="primary")],
         [InlineKeyboardButton(f"🟣 🧠 مرحله ۳ ({c3} فایل ذخیره)", callback_data="stage_detail_3", style="primary")],
-        [InlineKeyboardButton(f"🟠 💡 بخش ۴ ({pkg4} بسته | {c4} فایل)", callback_data="stage_detail_4", style="primary")],
+        [InlineKeyboardButton(f"🟠 💡 بخش ۴ ({pkg4} بسته/نوبت | {c4} فایل)", callback_data="stage_detail_4", style="primary")],
         [
             InlineKeyboardButton(f"🎯 روز ۸ ({c8} فایل)", callback_data="stage_detail_8", style="primary"),
             InlineKeyboardButton(f"🏆 روز ۳۰ ({c30} فایل)", callback_data="stage_detail_30", style="primary"),
@@ -162,18 +166,43 @@ def get_stages_selection_keyboard():
 
 def get_stage_action_keyboard(stage_num: int, has_content: bool = True):
     keyboard = []
-    if has_content:
-        keyboard.append([InlineKeyboardButton("👁 📥 مشاهده و پیش‌نمایش فایل‌ها (ارسال در چت)", callback_data=f"stage_preview_{stage_num}", style="success")])
-
     if stage_num == 4:
-        keyboard.append([InlineKeyboardButton("➕ 🎙 افزودن بسته آموزشی جدید (ویدیو/عکس + ویس)", callback_data="admin_record_4", style="primary")])
+        keyboard.append([InlineKeyboardButton("🎙 ➕ افزودن ویس تک و مجزا", callback_data="admin_record_4_solo", style="primary")])
+        keyboard.append([InlineKeyboardButton("📦 ➕ افزودن پکیج چندرسانه‌ای (ویدیو/عکس + ویس)", callback_data="admin_record_4_package", style="primary")])
+        keyboard.append([InlineKeyboardButton("🎯 🚀 انتخاب و ارسال دستی یک نوبت", callback_data="stage4_manual_menu", style="success")])
+        if has_content:
+            keyboard.append([InlineKeyboardButton("🔄 تفکیک فایل‌های موجود به ویس‌های تکی", callback_data="stage4_split_solo", style="primary")])
+            keyboard.append([InlineKeyboardButton("👁 📥 مشاهده تمام فایل‌های بخش ۴", callback_data="stage_preview_4", style="success")])
+            keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی کامل محتوای بخش ۴", callback_data="stage_clear_ask_4", style="danger")])
     else:
+        if has_content:
+            keyboard.append([InlineKeyboardButton("👁 📥 مشاهده و پیش‌نمایش فایل‌ها (ارسال در چت)", callback_data=f"stage_preview_{stage_num}", style="success")])
         keyboard.append([InlineKeyboardButton("➕ 🎙 افزودن فایل جدید به این مرحله", callback_data=f"admin_record_{stage_num}", style="primary")])
-
-    if has_content:
-        keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی و حذف کامل محتوای این مرحله", callback_data=f"stage_clear_ask_{stage_num}", style="danger")])
+        if has_content:
+            keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی و حذف کامل محتوای این مرحله", callback_data=f"stage_clear_ask_{stage_num}", style="danger")])
 
     keyboard.append([InlineKeyboardButton("🔙 📁 بازگشت به لیست مراحل", callback_data="admin_manage_stages", style="primary")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stage_4_options_keyboard(has_content: bool = True):
+    return get_stage_action_keyboard(4, has_content=has_content)
+
+def get_intro_management_keyboard(has_custom: bool = False):
+    keyboard = [
+        [InlineKeyboardButton("👁 📥 مشاهده و پیش‌نمایش پیام فعلی", callback_data="admin_preview_intro", style="success")],
+        [InlineKeyboardButton("✏️ 📝 تنظیم/تغییر پیام (متن، عکس، ویدیو، ویس)", callback_data="admin_edit_intro", style="primary")],
+    ]
+    if has_custom:
+        keyboard.append([InlineKeyboardButton("🗑 🔄 بازنشانی به متن پیش‌فرض سیستم", callback_data="admin_reset_intro", style="danger")])
+    keyboard.append([InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_broadcast_confirm_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📌 🚀 ارسال برای همه + پین (Pin) در چت 📌", callback_data="broadcast_confirm_pin", style="success")],
+        [InlineKeyboardButton("📨 فقط ارسال برای همه (بدون پین) 📨", callback_data="broadcast_confirm_nopin", style="primary")],
+        [InlineKeyboardButton("🔴 ❌ انصراف و لغو ارسال 🔙", callback_data="broadcast_cancel", style="danger")],
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_stage_clear_confirm_keyboard(stage_num: int):
@@ -237,7 +266,7 @@ def get_plan_duration_keyboard(target_user_id: int):
 
 # --- Content Delivery Helpers ---
 
-async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, greeting_name: str = ""):
+async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, greeting_name: str = "", is_resend: bool = False):
     msgs = database.get_stage_messages(config.DB_PATH, stage)
     student = database.get_student(config.DB_PATH, chat_id)
     curr_st = student["current_stage"] if student else stage
@@ -252,33 +281,50 @@ async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, 
         )
         return
 
+    # Filter out already delivered messages unless an explicit resend was requested
+    if not is_resend:
+        msgs_to_send = [m for m in msgs if not database.is_message_delivered(config.DB_PATH, chat_id, m["id"])]
+    else:
+        msgs_to_send = msgs
+
     safe_greeting = escape_md(greeting_name)
     name_phrase = f"{safe_greeting} عزیز، " if safe_greeting else ""
-    await bot.send_message(
-        chat_id=chat_id,
-        text=f"📚 **{name_phrase}محتوای مرحله {stage} برای شما ارسال می‌شود:**\n"
-             "لطفاً ویس‌ها و فایل‌های آموزشی را با دقت گوش داده و یادداشت‌برداری کنید 🌱✨",
-        parse_mode="Markdown"
-    )
 
-    for item in msgs:
-        try:
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=item["from_chat_id"],
-                message_id=item["message_id"]
-            )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.warning(f"Failed to copy message {item.get('message_id')} for stage {stage}: {e}")
+    if msgs_to_send:
+        resend_tag = "مجدداً " if is_resend else ""
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"📚 **{name_phrase}محتوای مرحله {stage} {resend_tag}برای شما ارسال می‌شود:**\n"
+                 "لطفاً ویس‌ها و فایل‌های آموزشی را با دقت گوش داده و یادداشت‌برداری کنید 🌱✨",
+            parse_mode="Markdown"
+        )
+
+        for item in msgs_to_send:
+            try:
+                await bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=item["from_chat_id"],
+                    message_id=item["message_id"]
+                )
+                database.record_message_delivery(config.DB_PATH, chat_id, stage, item["id"])
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"Failed to copy message {item.get('message_id')} for stage {stage}: {e}")
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"ℹ️ **{name_phrase}تمام ویس‌های مرحله {stage} قبلاً برای شما ارسال شده‌اند.**\n"
+                 "اگر مایل به شنیدن دوباره آنها هستید، از دکمه «ارسال مجدد» در پایین صفحه استفاده کنید 🔁",
+            parse_mode="Markdown"
+        )
 
     btn_text = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_stage} ➡️" if next_stage <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
     inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}", style="success")]])
 
     await bot.send_message(
         chat_id=chat_id,
-        text=f"✨ تمام ویس‌های **مرحله {stage}** ارسال شد 🎓\n"
-             "همچنین گزینه‌های کنترل همیشه در **پایین صفحه چت** در دسترس شما هستند:",
+        text=f"✨ وضعیت **مرحله {stage}** 🎓\n"
+             "پس از گوش دادن کامل به فایل‌ها، دکمه تایید زیر را لمس نمایید:",
         parse_mode="Markdown",
         reply_markup=inline_kb
     )
@@ -334,6 +380,9 @@ async def execute_drip_cycle(bot, force_ignore_interval: bool = False) -> int:
                 await asyncio.sleep(0.4)
 
             database.record_drip_package_delivery(config.DB_PATH, user_id, pkg_id, msg_ids)
+            for m in pkg_msgs:
+                database.record_message_delivery(config.DB_PATH, user_id, 4, m["id"])
+
             sent_count += 1
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -426,7 +475,7 @@ async def execute_study_plans_reminders(bot) -> int:
     return sent_count
 
 async def execute_inactivity_warnings(bot) -> int:
-    due_students = database.get_students_due_for_inactivity_warning(config.DB_PATH, threshold_days=2.0)
+    due_students = database.get_students_due_for_inactivity_warning(config.DB_PATH)
     sent_count = 0
 
     for st in due_students:
@@ -435,10 +484,21 @@ async def execute_inactivity_warnings(bot) -> int:
         name = escape_md(raw_name)
         stage = st["current_stage"]
         next_stage = stage + 1
+        hours = int(st.get("hours_waiting", 18 if stage == 1 else 24))
+
+        if stage == 1:
+            time_desc = f"بیش از ۱۸ ساعت ({hours} ساعت)"
+            action_desc = "ویس‌های **مرحله ۱** را گوش نداده‌اید و وارد مرحله دوم نشده‌اید!"
+        elif stage == 2:
+            time_desc = f"بیش از ۲۴ ساعت ({hours} ساعت)"
+            action_desc = "در **مرحله ۲** هستید و هنوز وارد مرحله سوم نشده‌اید!"
+        else:
+            time_desc = f"بیش از ۲۴ ساعت ({hours} ساعت)"
+            action_desc = "در **مرحله ۳** هستید و وارد فاز ۴ نشده‌اید!"
 
         warning_text = (
             f"⚠️ **{name} عزیز، یک یادآوری بسیار مهم!** ⏳\n\n"
-            f"الان بیش از ۲ روز است که ویس‌های **مرحله {stage}** را گوش نداده‌اید!\n"
+            f"الان {time_desc} است که {action_desc}\n"
             "مسیر مشاوره نیازمند استمرار و تعهد شماست و نباید از برنامه عقب بمانید 🌱\n\n"
             "📌 **حتماً تا آخر امشب وقت بگذارید، ویس‌های این مرحله را کامل گوش دهید و وارد مرحله بعد شوید.**\n\n"
             f"🔒 **توجه:** در حال حاضر برای شما محدودیت ایجاد شده است چون هنوز در مرحله {stage} هستید. "
@@ -461,7 +521,7 @@ async def execute_inactivity_warnings(bot) -> int:
             )
             database.mark_inactivity_warning_sent(config.DB_PATH, user_id)
             sent_count += 1
-            logger.info(f"Inactivity warning sent to student {raw_name} ({user_id}) for stage {stage}.")
+            logger.info(f"Inactivity warning sent to student {raw_name} ({user_id}) for stage {stage} ({hours}h).")
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Error sending inactivity warning to user {user_id}: {e}")
@@ -625,12 +685,46 @@ async def start_handler(update, context):
             await update.message.reply_text(
                 f"✨ **{salutation}**\n\n"
                 "به ربات مشاوره تحصیلی دکتر هاشمی خوش آمدید 🌱🎓\n"
-                "فرآیند آموزشی شما در ۳ مرحله طراحی شده است.\n"
-                "آماده‌اید؟ مرحله اول همین الان برای شما ارسال می‌شود 🚀:",
+                "مسیر آموزشی شما در ۳ مرحله اولیه و سپس فاز تکمیلی طراحی شده است.",
                 parse_mode="Markdown",
                 reply_markup=get_student_reply_keyboard(1)
             )
-            await deliver_stage_content(context.bot, user_id, stage=1, next_stage=2, greeting_name=display_name)
+
+            # Check for Custom Intro / Red Lines Content
+            intro = database.get_intro_content(config.DB_PATH)
+            if intro and (intro.get("message_id") or intro.get("text_content")):
+                if intro.get("message_id") and intro.get("from_chat_id"):
+                    try:
+                        await context.bot.copy_message(
+                            chat_id=user_id,
+                            from_chat_id=intro["from_chat_id"],
+                            message_id=intro["message_id"]
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not copy intro message: {e}")
+                elif intro.get("text_content"):
+                    await update.message.reply_text(
+                        intro["text_content"],
+                        parse_mode="Markdown"
+                    )
+            else:
+                default_intro = (
+                    "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره:**\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
+                    "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
+                    "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
+                )
+                await update.message.reply_text(default_intro, parse_mode="Markdown")
+
+            start_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🟢 ✅ مطالعه کردم | شروع مرحله اول 🚀", callback_data="student_start_stage_1", style="success")
+            ]])
+            await update.message.reply_text(
+                "👇 *لطفاً موارد فوق را با دقت مطالعه نموده و سپس جهت شروع مرحله اول روی دکمه زیر بزنید:*",
+                parse_mode="Markdown",
+                reply_markup=start_kb
+            )
 
             # Alert admin that a student just joined and is now in their students list
             if config.ADMIN_ID and user_id != config.ADMIN_ID:
@@ -640,7 +734,7 @@ async def start_handler(update, context):
                         chat_id=config.ADMIN_ID,
                         text=f"🔔 **دانش‌آموز جدید ثبت‌نام شد:** 👤\n\n"
                              f"• نام: **{safe_display_name}** ({uname})\n"
-                             "• کد دعوت با موفقیت فعال شد و این دانش‌آموز به لیست دانش‌آموزان شما اضافه گردید 🎯",
+                             "• کد دعوت فعال شد و پیام خط قرمزها برای او ارسال گردید 🎯",
                         parse_mode="Markdown"
                     )
                 except Exception as e:
@@ -743,30 +837,38 @@ async def admin_callback_handler(update, context):
         st_title = get_stage_display_name(stage_num)
         msgs = database.get_stage_messages(config.DB_PATH, stage_num)
         count = len(msgs)
-        # Activate recording state for this stage immediately so forwarding files works right away or via the button
-        active_states[user_id] = f"RECORD_STAGE_{stage_num}"
-        active_package_ids[user_id] = int(get_iran_now().timestamp())
         if stage_num == 4:
+            active_states[user_id] = None
             pkg_count = database.get_stage_4_package_count(config.DB_PATH)
             detail_txt = (
                 f"🗂 **مدیریت و وضعیت محتوای «{st_title}»**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 تعداد کل بسته‌های آموزشی: **{pkg_count} بسته**\n"
+                f"📦 تعداد کل نوبت‌ها و بسته‌ها: **{pkg_count} نوبت**\n"
                 f"📎 مجموع فایل‌های ثبت‌شده: **{count} فایل** (ویدیو/عکس/ویس)\n\n"
-                "📥 **حالت دریافت فایل برای این بخش فعال است:** می‌توانید همین الان فایل‌های جدید را فوروارد کنید یا از دکمه‌های زیر استفاده نمایید:"
+                "در این بخش می‌توانید به دو روش ویس/فایل اضافه کنید، یا یک نوبت را دستی ارسال نمایید:\n"
+                "• 🎙 **ویس تک و مجزا:** هر ویس یک نوبت ارسال جداگانه خواهد بود.\n"
+                "• 📦 **پکیج چندرسانه‌ای:** ویدیو یا عکس همراه با ویس توضیحات در یک بسته متصل.\n"
+                "• 🎯 **انتخاب و ارسال دستی:** ارسال فوری یک نوبت دلخواه به دانش‌آموزان واجد شرایط."
+            )
+            await query.message.reply_text(
+                detail_txt,
+                parse_mode="Markdown",
+                reply_markup=get_stage_action_keyboard(4, has_content=(count > 0))
             )
         else:
+            active_states[user_id] = f"RECORD_STAGE_{stage_num}"
+            active_package_ids[user_id] = int(get_iran_now().timestamp())
             detail_txt = (
                 f"🗂 **مدیریت و وضعیت محتوای «{st_title}»**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"📎 تعداد فایل‌های ثبت‌شده در این مرحله: **{count} پیام**\n\n"
                 "📥 **حالت دریافت فایل برای این مرحله فعال است:** می‌توانید همین الان ویس‌ها و فایل‌های جدید را فوروارد کنید یا از گزینه‌های زیر استفاده نمایید:"
             )
-        await query.message.reply_text(
-            detail_txt,
-            parse_mode="Markdown",
-            reply_markup=get_stage_action_keyboard(stage_num, has_content=(count > 0))
-        )
+            await query.message.reply_text(
+                detail_txt,
+                parse_mode="Markdown",
+                reply_markup=get_stage_action_keyboard(stage_num, has_content=(count > 0))
+            )
 
     elif data.startswith("stage_preview_"):
         stage_num = int(data.split("_")[-1])
@@ -859,14 +961,340 @@ async def admin_callback_handler(update, context):
         await execute_morning_quotes_cycle(context.bot, target_user_id=user_id)
         return
 
+    # --- Section 4 Menus, Solo / Package Recording & Manual Picker ---
+    elif data in ("admin_record_4", "admin_record_4_menu"):
+        active_states[user_id] = None
+        c4 = len(database.get_stage_messages(config.DB_PATH, 4))
+        pkg4 = database.get_stage_4_package_count(config.DB_PATH)
+        await query.message.reply_text(
+            "🟣 💡 **مدیریت و بارگذاری محتوای «بخش ۴»:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 وضعیت فعلی: **{pkg4} نوبت/بسته** ({c4} فایل ذخیره)\n\n"
+            "نحوه افزودن محتوا یا ارسال را انتخاب کنید:\n"
+            "• 🎙 **ویس تک و مجزا:** مناسب ارسال ویس‌های تکی در هر نوبت\n"
+            "• 📦 **پکیج چندرسانه‌ای:** مناسب ترکیب ویدیو یا عکس همراه با ویس توضیحات\n"
+            "• 🎯 **انتخاب و ارسال دستی:** انتخاب و ارسال یک نوبت خاص به افراد واجد شرایط",
+            parse_mode="Markdown",
+            reply_markup=get_stage_4_options_keyboard(has_content=(c4 > 0))
+        )
+
+    elif data == "admin_record_4_solo":
+        active_states[user_id] = "RECORD_STAGE_4_SOLO"
+        await query.message.reply_text(
+            "🎙 **حالت ذخیره‌سازی ویس‌های تک و مجزا (بخش ۴) فعال شد.** 🟢\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📥 هم‌اکنون ویس‌های خود را یکی‌یکی به این چت فوروارد کنید.\n"
+            "✨ *هر ویسی که بفرستید به عنوان یک «نوبت ارسال مجزا» ثبت می‌شود و هیچ‌گاه یکجا ارسال نخواهد شد.*\n\n"
+            "👇 پس از اتمام فوروارد ویس‌ها، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data == "admin_record_4_package":
+        active_states[user_id] = "RECORD_STAGE_4_PACKAGE"
+        active_package_ids[user_id] = int(get_iran_now().timestamp())
+        await query.message.reply_text(
+            "📦 **حالت ذخیره‌سازی پکیج چندرسانه‌ای (بخش ۴) فعال شد.** 🟢\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📥 اکنون می‌توانید فایل‌های این پکیج (ویدیو، عکس، ویس) را پشت سر هم بفرستید.\n"
+            "✨ *ربات تمامی این فایل‌ها را در قالب یک بسته متصل ذخیره کرده و در روز نوبت با هم به دانش‌آموز تحویل می‌دهد.*\n\n"
+            "👇 پس از پایان ارسال فایل‌های این پکیج، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data == "stage4_split_solo":
+        split_count = database.split_stage_4_messages_to_solo(config.DB_PATH)
+        tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+        await query.message.reply_text(
+            f"✅ **عملیات تفکیک با موفقیت انجام شد!** 🟢✨\n\n"
+            f"تعداد {split_count} فایل در بخش ۴ به **{tot_pkg} نوبت ارسالی مستقل** تبدیل شدند.\n"
+            "از این پس در هر بار ارسال فقط یک فایل به دانش‌آموز ارسال خواهد شد.",
+            parse_mode="Markdown",
+            reply_markup=get_stage_4_options_keyboard(has_content=True)
+        )
+
+    elif data == "stage4_manual_menu":
+        packages = database.get_stage_4_packages_summary(config.DB_PATH)
+        if not packages:
+            await query.message.reply_text(
+                "ℹ️ هیچ فایل یا پکیجی در بخش ۴ ذخیره نشده است.",
+                parse_mode="Markdown",
+                reply_markup=get_stage_4_options_keyboard(has_content=False)
+            )
+            return
+
+        kb_rows = []
+        for pkg in packages:
+            idx = pkg["index"]
+            pid = pkg["package_id"]
+            cnt = pkg["count"]
+            cap = (pkg.get("caption") or "")[:20]
+            cap_part = f" - {cap}" if cap else ""
+            label = f"📦 نوبت {idx} ({cnt} فایل){cap_part}" if cnt > 1 else f"🎙 نوبت {idx} (ویس تک){cap_part}"
+            kb_rows.append([InlineKeyboardButton(label, callback_data=f"stage4_pick_{pid}", style="primary")])
+
+        kb_rows.append([InlineKeyboardButton("🔙 بازگشت به منوی بخش ۴", callback_data="admin_record_4_menu", style="danger")])
+        await query.message.reply_text(
+            "🎯 **انتخاب نوبت جهت ارسال دستی یا مشاهده جزئیات:**\n"
+            "نوبت مورد نظر خود را از لیست زیر انتخاب نمایید:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows)
+        )
+
+    elif data.startswith("stage4_pick_"):
+        pid = int(data.split("_")[-1])
+        packages = database.get_stage_4_packages_summary(config.DB_PATH)
+        target_pkg = next((p for p in packages if p["package_id"] == pid), None)
+        if not target_pkg:
+            await query.message.reply_text("❌ نوبت مورد نظر یافت نشد.")
+            return
+
+        missing_students = database.get_students_missing_stage_4_package(config.DB_PATH, pid)
+        idx = target_pkg["index"]
+        cnt = target_pkg["count"]
+        type_str = f"پکیج چندرسانه‌ای ({cnt} فایل)" if cnt > 1 else "ویس تک و مجزا"
+
+        if missing_students:
+            st_list_str = "\n".join([f"• {escape_md(s.get('assigned_name') or s.get('full_name'))}" for s in missing_students[:10]])
+            if len(missing_students) > 10:
+                st_list_str += f"\n... و {len(missing_students) - 10} نفر دیگر"
+        else:
+            st_list_str = "تمام دانش‌آموزان فاز ۴ این نوبت را قبلاً دریافت کرده‌اند ✅"
+
+        detail_text = (
+            f"🎯 **مشخصات نوبت شماره {idx} (کد پکیج: `{pid}`):**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"• نوع محتوا: **{type_str}**\n"
+            f"• تعداد فایل‌ها: **{cnt} فایل**\n\n"
+            f"👥 **دانش‌آموزان واجد شرایطی که هنوز این نوبت را نگرفته‌اند ({len(missing_students)} نفر):**\n"
+            f"{st_list_str}\n\n"
+            "👇 جهت ارسال اختصاصی همین نوبت به افراد فوق یا پیش‌نمایش، دکمه مورد نظر را لمس کنید:"
+        )
+
+        buttons = []
+        if missing_students:
+            buttons.append([InlineKeyboardButton(f"🚀 ارسال این نوبت برای {len(missing_students)} دانش‌آموز واجد شرایط", callback_data=f"stage4_send_{pid}", style="success")])
+        buttons.append([InlineKeyboardButton("👁 پیش‌نمایش فایل‌های این نوبت در پی‌وی من", callback_data=f"stage4_prevpkg_{pid}", style="primary")])
+        buttons.append([InlineKeyboardButton("🔙 بازگشت به لیست نوبت‌ها", callback_data="stage4_manual_menu", style="danger")])
+
+        await query.message.reply_text(detail_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("stage4_prevpkg_"):
+        pid = int(data.split("_")[-1])
+        packages = database.get_stage_4_packages_summary(config.DB_PATH)
+        target_pkg = next((p for p in packages if p["package_id"] == pid), None)
+        if not target_pkg:
+            await query.message.reply_text("❌ نوبت یافت نشد.")
+            return
+
+        await query.message.reply_text(f"⏳ در حال ارسال پیش‌نمایش نوبت شماره {target_pkg['index']} ({target_pkg['count']} فایل)...")
+        for m in target_pkg["messages"]:
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=m["from_chat_id"],
+                    message_id=m["message_id"]
+                )
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning(f"Could not copy message {m['id']} for preview: {e}")
+
+    elif data.startswith("stage4_send_"):
+        pid = int(data.split("_")[-1])
+        packages = database.get_stage_4_packages_summary(config.DB_PATH)
+        target_pkg = next((p for p in packages if p["package_id"] == pid), None)
+        if not target_pkg:
+            await query.message.reply_text("❌ نوبت یافت نشد.")
+            return
+
+        missing_students = database.get_students_missing_stage_4_package(config.DB_PATH, pid)
+        if not missing_students:
+            await query.message.reply_text("ℹ️ تمامی دانش‌آموزان واجد شرایط قبلاً این نوبت را دریافت کرده‌اند.")
+            return
+
+        pkg_msgs = target_pkg["messages"]
+        msg_ids = [m["id"] for m in pkg_msgs]
+
+        await query.message.reply_text(f"⏳ در حال ارسال نوبت شماره {target_pkg['index']} به {len(missing_students)} دانش‌آموز...")
+        sent_count = 0
+        for st in missing_students:
+            st_uid = st["user_id"]
+            raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+            name = escape_md(raw_name)
+
+            try:
+                if len(pkg_msgs) > 1:
+                    intro_text = (
+                        f"🌸 **سلام {name} عزیز، وقتت بخیر!** 🌱✨\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎙🎬 **مبحث تکمیلی جدید دکتر هاشمی ({len(pkg_msgs)} فایل پیوسته) برای شما ارسال می‌شود:**\n\n"
+                        "📌 لطفاً تمام فایل‌های این بسته آموزشی را با دقت مشاهده کرده و گوش دهید 🎓"
+                    )
+                else:
+                    caption_text = f"\n\n{escape_md(pkg_msgs[0].get('caption'))}" if pkg_msgs[0].get("caption") else ""
+                    intro_text = (
+                        f"🌸 **سلام {name} عزیز، وقتت بخیر!** 🌱✨\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🎙 **مبحث تکمیلی جدید از طرف دکتر هاشمی برای شما ارسال می‌شود:**{caption_text}"
+                    )
+
+                await context.bot.send_message(chat_id=st_uid, text=intro_text, parse_mode="Markdown")
+
+                for m in pkg_msgs:
+                    await context.bot.copy_message(
+                        chat_id=st_uid,
+                        from_chat_id=m["from_chat_id"],
+                        message_id=m["message_id"]
+                    )
+                    await asyncio.sleep(0.3)
+
+                database.record_drip_package_delivery(config.DB_PATH, st_uid, pid, msg_ids)
+                for m in pkg_msgs:
+                    database.record_message_delivery(config.DB_PATH, st_uid, 4, m["id"])
+
+                sent_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Error sending manual stage 4 package {pid} to {st_uid}: {e}")
+
+        await query.message.reply_text(
+            f"🎉 **نوبت شماره {target_pkg['index']} با موفقیت برای {sent_count} دانش‌آموز ارسال شد!** 🟢✨\n"
+            "(ارسال تکراری به صفر رسیده و هیچ پیامی مجدد فرستاده نشد)",
+            parse_mode="Markdown",
+            reply_markup=get_stage_4_options_keyboard(has_content=True)
+        )
+
+    # --- Intro / Red Lines Management ---
+    elif data == "admin_intro_menu":
+        intro = database.get_intro_content(config.DB_PATH)
+        has_custom = intro is not None
+        st_text = "اختصاصی (تنظیم شده توسط شما) ✅" if has_custom else "متن پیش‌فرض سیستم 📋"
+        await query.message.reply_text(
+            "📜 **تنظیمات پیام خوش‌آمد و خط قرمزهای مشاوره:** 📌\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "این محتوا قبل از ارسال ویس‌های مرحله اول، به محض ورود دانش‌آموز با لینک دعوت برایش نمایش داده می‌شود تا با آمادگی کامل شروع کند.\n\n"
+            f"• **وضعیت کنونی:** {st_text}\n\n"
+            "جهت مشاهده، ویرایش یا بازنشانی از دکمه‌های زیر استفاده کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_intro_management_keyboard(has_custom=has_custom)
+        )
+
+    elif data == "admin_preview_intro":
+        intro = database.get_intro_content(config.DB_PATH)
+        if intro and (intro.get("message_id") or intro.get("text_content")):
+            await query.message.reply_text("👁 **پیش‌نمایش پیام خوش‌آمد و خط قرمزهای فعلی شما:**")
+            if intro.get("message_id") and intro.get("from_chat_id"):
+                try:
+                    await context.bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=intro["from_chat_id"],
+                        message_id=intro["message_id"]
+                    )
+                except Exception as e:
+                    await query.message.reply_text(f"خطا در ارسال پیش‌نمایش فایل: {e}")
+            elif intro.get("text_content"):
+                await query.message.reply_text(intro["text_content"], parse_mode="Markdown")
+        else:
+            default_intro = (
+                "📌 **توضیحات و خط قرمزهای مهم مشاوره (پیش‌فرض):**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "۱. **تعهد روزانه:** ویس‌ها را در همان روز با تمرکز کامل گوش دهید و یادداشت‌برداری کنید 🌱\n"
+                "۲. **گزارش‌دهی دقیق:** لیست مباحث خوانده‌شده را منظم ارسال کنید تا برنامه جدید برایتان تنظیم شود 📝\n"
+                "۳. **استمرار:** این مسیر تا روز کنکور همراه شماست؛ با تعهد کامل قدم بردارید 🚀✨"
+            )
+            await query.message.reply_text(f"👁 **پیش‌نمایش متن پیش‌فرض سیستم:**\n\n{default_intro}", parse_mode="Markdown")
+
+    elif data == "admin_edit_intro":
+        active_states[user_id] = "AWAITING_INTRO_CONTENT"
+        await query.message.reply_text(
+            "📝 **لطفاً پیام خوش‌آمد و خط قرمزهای جدید را ارسال کنید:**\n\n"
+            "می‌توانید یک متن تایپ کنید، یا یک ویس، عکس، ویدیو یا فایل فوروارد نمایید.\n"
+            "👇 جهت انصراف دکمه زیر را لمس نمایید:",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data == "admin_reset_intro":
+        database.clear_intro_content(config.DB_PATH)
+        await query.message.reply_text(
+            "🗑 **پیام خوش‌آمد و خط قرمزها به حالت پیش‌فرض بازنشانی شد.** 🟢",
+            parse_mode="Markdown",
+            reply_markup=get_intro_management_keyboard(has_custom=False)
+        )
+
+    # --- Broadcast Management ---
+    elif data == "admin_broadcast_menu":
+        active_states[user_id] = "AWAITING_BROADCAST_CONTENT"
+        await query.message.reply_text(
+            "📢 **ارسال پیام همگانی برای تمامی دانش‌آموزان:** 📌\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📥 لطفاً پیام، ویس، ویدیو، عکس یا متن مورد نظر را در همین چت ارسال یا فوروارد نمایید.\n\n"
+            "*(در مرحله بعد می‌توانید انتخاب کنید که پیام در پی‌وی دانش‌آموزان پین شود یا خیر)*\n"
+            "👇 جهت انصراف دکمه زیر را لمس کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data in ("broadcast_confirm_pin", "broadcast_confirm_nopin"):
+        should_pin = (data == "broadcast_confirm_pin")
+        item = pending_broadcast.pop(user_id, None)
+        if not item:
+            await query.message.reply_text("❌ پیامی برای ارسال یافت نشد یا منقضی شده است.")
+            return
+
+        students = database.list_students(config.DB_PATH)
+        if not students:
+            await query.message.reply_text("ℹ️ هنوز هیچ دانش‌آموزی در ربات ثبت‌نام نکرده است.")
+            return
+
+        await query.message.reply_text(f"⏳ در حال ارسال پیام همگانی به {len(students)} دانش‌آموز... لطفاً شکیبا باشید.")
+        sent_count = 0
+        pin_count = 0
+
+        for st in students:
+            st_uid = st["user_id"]
+            try:
+                sent_msg = await context.bot.copy_message(
+                    chat_id=st_uid,
+                    from_chat_id=item["from_chat_id"],
+                    message_id=item["message_id"]
+                )
+                sent_count += 1
+                if should_pin:
+                    try:
+                        await context.bot.pin_chat_message(chat_id=st_uid, message_id=sent_msg.message_id)
+                        pin_count += 1
+                    except Exception as pe:
+                        logger.warning(f"Could not pin message for user {st_uid}: {pe}")
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                logger.warning(f"Could not broadcast message to user {st_uid}: {e}")
+
+        pin_status_str = f"📌 پین در پی‌وی فعال شد ({pin_count} پین موفق)" if should_pin else "بدون پین"
+        await query.message.reply_text(
+            f"🎉 **پیام همگانی با موفقیت ارسال شد!** 🟢✨\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"• تعداد دریافت‌کنندگان موفق: **{sent_count} نفر** از {len(students)}\n"
+            f"• وضعیت پین: **{pin_status_str}**",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
+        )
+
+    elif data == "broadcast_cancel":
+        pending_broadcast.pop(user_id, None)
+        await query.message.reply_text(
+            "❌ **ارسال پیام همگانی لغو شد.**",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
+        )
+
     elif data.startswith("admin_record_"):
         stage_num = int(data.split("_")[-1])
         active_states[user_id] = f"RECORD_STAGE_{stage_num}"
         active_package_ids[user_id] = int(get_iran_now().timestamp())
         if stage_num <= 3:
             stage_title = f"مرحله {stage_num}"
-        elif stage_num == 4:
-            stage_title = "بخش ۴ (بسته آموزشی جدید)"
         elif stage_num == 8:
             stage_title = "محتوای روز هشتم مشاوره 🎯"
         elif stage_num == 30:
@@ -874,17 +1302,11 @@ async def admin_callback_handler(update, context):
         else:
             stage_title = f"بخش {stage_num}"
 
-        note_text = (
-            "✨ *نکته هوشمند بخش ۴:* اگر یک ویدیو یا عکس همراه با ویس توضیحات دارید، همه را پشت سر هم بفرستید؛ ربات آنها را در قالب یک بسته پیوسته ذخیره کرده و در روز نوبت با هم به دانش‌آموز تحویل می‌دهد.\n\n"
-            if stage_num == 4 else ""
-        )
-
         await query.message.reply_text(
             f"🎙 **حالت ذخیره‌سازی برای «{stage_title}» فعال شد.**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "📥 هم‌اکنون پیام‌ها، ویس‌ها، ویدیوها و فایل‌ها را به این چت فوروارد کنید.\n"
-            f"{note_text}"
-            "👇 پس از پایان ارسال فایل‌های این بسته، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
+            "📥 هم‌اکنون پیام‌ها، ویس‌ها و فایل‌ها را به این چت فوروارد کنید.\n\n"
+            "👇 پس از پایان ارسال فایل‌ها، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
             parse_mode="Markdown",
             reply_markup=get_recording_reply_keyboard()
         )
@@ -1023,7 +1445,18 @@ async def student_callback_handler(update, context):
     data = query.data
     name = student.get("assigned_name") or "دانش‌آموز"
 
-    if data.startswith("student_goto_"):
+    if data == "student_start_stage_1":
+        database.update_student_stage(config.DB_PATH, user_id, 1)
+        await query.message.reply_text(
+            f"👏 **آفرین {name} عزیز! ورود به مرحله اول با موفقیت ثبت شد.** 🌱✨\n"
+            "فایل‌ها و ویس‌های این مرحله برای شما ارسال می‌شوند:",
+            parse_mode="Markdown",
+            reply_markup=get_student_reply_keyboard(1)
+        )
+        await deliver_stage_content(context.bot, user_id, stage=1, next_stage=2, greeting_name=name)
+        return
+
+    elif data.startswith("student_goto_"):
         next_stage = int(data.split("_")[-1])
         database.update_student_stage(config.DB_PATH, user_id, next_stage)
 
@@ -1054,7 +1487,7 @@ async def student_callback_handler(update, context):
             f"🔄 **{name} عزیز، محتوای مرحله {st_num} مجدداً برای شما ارسال می‌شود:**",
             parse_mode="Markdown"
         )
-        await deliver_stage_content(context.bot, user_id, stage=st_num, next_stage=st_num + 1, greeting_name=name)
+        await deliver_stage_content(context.bot, user_id, stage=st_num, next_stage=st_num + 1, greeting_name=name, is_resend=True)
 
     elif data == "student_start_report":
         active_states[user_id] = "AWAITING_STUDY_REPORT"
@@ -1116,19 +1549,39 @@ async def message_collector(update, context):
             curr_state = active_states.get(user_id) or ""
             active_states[user_id] = None
             pkg_id = active_package_ids.pop(user_id, None)
-            stage_num = int(curr_state.split("_")[-1]) if "RECORD_STAGE_" in curr_state else 1
 
-            conn = database.get_connection(config.DB_PATH)
-            try:
-                cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
-                pkg_cnt = cur.fetchone()["cnt"] if pkg_id else 0
-            finally:
-                conn.close()
-
-            if stage_num == 4:
-                tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+            if curr_state in ("AWAITING_INTRO_CONTENT", "AWAITING_BROADCAST_CONTENT"):
+                pending_broadcast.pop(user_id, None)
                 await msg.reply_text(
-                    "🎉 **بسته آموزشی بخش ۴ با موفقیت ذخیره شد!** 🟢✨\n"
+                    "❌ **عملیات لغو شد و به منوی اصلی مدیریت بازگشتید.**",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_reply_keyboard()
+                )
+                return
+
+            if curr_state == "RECORD_STAGE_4_SOLO":
+                tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+                c4 = len(database.get_stage_messages(config.DB_PATH, 4))
+                await msg.reply_text(
+                    "🎉 **ویس‌های تک و مجزای بخش ۴ با موفقیت ذخیره شدند!** 🟢✨\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 مجموع کل نوبت‌های آماده بخش ۴: **{tot_pkg} نوبت** ({c4} فایل)\n\n"
+                    "💡 *هر یک از این ویس‌ها به عنوان یک نوبت مستقل ذخیره شدند و در هر نوبت ارسال، فقط یکی از آن‌ها به دانش‌آموز تحویل داده می‌شود.* 🚀",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_reply_keyboard()
+                )
+                return
+            elif curr_state in ("RECORD_STAGE_4_PACKAGE", "RECORD_STAGE_4"):
+                tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+                conn = database.get_connection(config.DB_PATH)
+                try:
+                    cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
+                    pkg_cnt = cur.fetchone()["cnt"] if pkg_id else 0
+                finally:
+                    conn.close()
+
+                await msg.reply_text(
+                    "🎉 **بسته چندرسانه‌ای بخش ۴ با موفقیت ذخیره شد!** 🟢✨\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     f"📦 تعداد فایل‌های این بسته: **{pkg_cnt} فایل** (ویدیو/عکس + ویس)\n"
                     f"📊 مجموع کل بسته‌های آماده بخش ۴: **{tot_pkg} بسته**\n\n"
@@ -1136,7 +1589,9 @@ async def message_collector(update, context):
                     parse_mode="Markdown",
                     reply_markup=get_admin_reply_keyboard()
                 )
+                return
             else:
+                stage_num = int(curr_state.split("_")[-1]) if ("RECORD_STAGE_" in curr_state and curr_state.split("_")[-1].isdigit()) else 1
                 count = len(database.get_stage_messages(config.DB_PATH, stage_num))
                 await msg.reply_text(
                     f"✅ **عملیات ثبت محتوا برای مرحله {stage_num} به پایان رسید.** 🟢\n"
@@ -1145,7 +1600,7 @@ async def message_collector(update, context):
                     parse_mode="Markdown",
                     reply_markup=get_admin_reply_keyboard()
                 )
-            return
+                return
 
         # B) Bottom Keyboard navigation for Admin (checked BEFORE state inputs so menu buttons always work)
         if "ساخت لینک جدید" in text:
@@ -1170,19 +1625,48 @@ async def message_collector(update, context):
             return
 
         elif "افزودن فایل به بخش ۴" in text:
-            active_states[user_id] = "RECORD_STAGE_4"
-            active_package_ids[user_id] = int(get_iran_now().timestamp())
+            active_states[user_id] = None
+            c4 = len(database.get_stage_messages(config.DB_PATH, 4))
+            pkg4 = database.get_stage_4_package_count(config.DB_PATH)
             await msg.reply_text(
-                "🟣 🎙 **حالت ذخیره‌سازی بسته جدید برای «بخش ۴» فعال شد.** 💡\n"
+                "🟣 💡 **مدیریت و بارگذاری محتوای «بخش ۴»:**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "📥 اکنون می‌توانید فایل‌های این نوبت را فوروارد کنید:\n"
-                "• یک ویس تک و مجزا\n"
-                "• یا یک ویدیو همراه با ویس توضیحات\n"
-                "• یا یک تصویر همراه با ویس توضیحات\n\n"
-                "✨ *ربات به صورت خودکار تمام فایل‌هایی که اکنون بفرستید را در قالب یک بسته واحد متصل ذخیره می‌کند و در روز نوبت با هم به دانش‌آموز تحویل می‌دهد.*\n\n"
-                "👇 پس از ارسال فایل‌های این بسته، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** در پایین صفحه را بزنید.",
+                f"📊 وضعیت فعلی: **{pkg4} نوبت/بسته** ({c4} فایل ذخیره)\n\n"
+                "لطفاً نحوه ذخیره‌سازی محتوا را انتخاب کنید:\n"
+                "• 🎙 **ویس تک و مجزا:** مناسب زمانی که ویس‌های تکی دارید و می‌خواهید هر کدام در یک روز/نوبت مجزا فرستاده شوند\n"
+                "• 📦 **پکیج چندرسانه‌ای:** مناسب زمانی که می‌خواهید یک ویدیو یا عکس همراه با ویس توضیحات آن در یک روز با هم فرستاده شوند\n"
+                "• 🎯 **انتخاب و ارسال دستی:** انتخاب و ارسال یک نوبت خاص به افراد واجد شرایط",
+                parse_mode="Markdown",
+                reply_markup=get_stage_4_options_keyboard(has_content=(c4 > 0))
+            )
+            return
+
+        elif "ارسال پیام همگانی" in text:
+            active_states[user_id] = "AWAITING_BROADCAST_CONTENT"
+            await msg.reply_text(
+                "📢 **ارسال پیام همگانی برای تمامی دانش‌آموزان:** 📌\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📥 لطفاً پیام، ویس، ویدیو، عکس یا متن مورد نظر را در همین چت ارسال یا فوروارد نمایید.\n\n"
+                "*(در مرحله بعد می‌توانید انتخاب کنید که پیام در پی‌وی دانش‌آموزان پین شود یا خیر)*\n"
+                "👇 جهت انصراف دکمه زیر را لمس کنید:",
                 parse_mode="Markdown",
                 reply_markup=get_recording_reply_keyboard()
+            )
+            return
+
+        elif "پیام خوش‌آمد و خط قرمزها" in text:
+            active_states[user_id] = None
+            intro = database.get_intro_content(config.DB_PATH)
+            has_custom = intro is not None
+            st_text = "اختصاصی (تنظیم شده توسط شما) ✅" if has_custom else "متن پیش‌فرض سیستم 📋"
+            await msg.reply_text(
+                "📜 **تنظیمات پیام خوش‌آمد و خط قرمزهای مشاوره:** 📌\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "این محتوا قبل از ارسال ویس‌های مرحله اول، به محض ورود دانش‌آموز با لینک دعوت برایش نمایش داده می‌شود تا با آمادگی کامل شروع کند.\n\n"
+                f"• **وضعیت کنونی:** {st_text}\n\n"
+                "جهت مشاهده، ویرایش یا بازنشانی از دکمه‌های زیر استفاده کنید:",
+                parse_mode="Markdown",
+                reply_markup=get_intro_management_keyboard(has_custom=has_custom)
             )
             return
 
@@ -1280,7 +1764,57 @@ async def message_collector(update, context):
             await msg.reply_text(reply_text, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
             return
 
-        # D) State: Custom days input for study plan
+        # D) State: Waiting for intro/rules content
+        if state == "AWAITING_INTRO_CONTENT":
+            active_states[user_id] = None
+            caption = msg.caption or (text if text else None)
+            is_media = bool(msg.voice or msg.video or msg.photo or msg.audio or msg.document or msg.animation)
+
+            if is_media:
+                database.set_intro_content(
+                    config.DB_PATH,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    caption=caption,
+                    text_content=None
+                )
+            else:
+                database.set_intro_content(
+                    config.DB_PATH,
+                    text_content=text,
+                    from_chat_id=None,
+                    message_id=None,
+                    caption=None
+                )
+
+            await msg.reply_text(
+                "🎉 **پیام خوش‌آمد و خط قرمزهای جدید با موفقیت ذخیره شد!** 🟢✨\n"
+                "از این پس هر دانش‌آموز جدیدی که از طریق لینک دعوت وارد شود، ابتدا این پیام را مشاهده کرده و پس از فشردن دکمه تایید، ویس‌های مرحله اول برایش ارسال خواهد شد.",
+                parse_mode="Markdown",
+                reply_markup=get_admin_reply_keyboard()
+            )
+            return
+
+        # E) State: Waiting for broadcast content
+        if state == "AWAITING_BROADCAST_CONTENT":
+            pending_broadcast[user_id] = {
+                "from_chat_id": msg.chat_id,
+                "message_id": msg.message_id,
+                "text": text,
+                "caption": msg.caption
+            }
+            active_states[user_id] = None
+            await msg.reply_text(
+                "📥 **پیام همگانی با موفقیت دریافت شد!**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "آیا تمایل دارید این پیام در صفحه گفتگوی (پی‌وی) تمامی دانش‌آموزان به صورت **سنجاق‌شده (Pin)** نمایش داده شود؟\n\n"
+                "👇 لطفاً یکی از گزینه‌های زیر را انتخاب نمایید:",
+                parse_mode="Markdown",
+                reply_markup=get_broadcast_confirm_keyboard()
+            )
+            return
+
+        # F) State: Custom days input for study plan
         if state and state.startswith("AWAITING_CUSTOM_DAYS_"):
             target_uid = int(state.split("_")[-1])
             active_states[user_id] = None
@@ -1312,38 +1846,78 @@ async def message_collector(update, context):
                 pass
             return
 
-        # E) State: Recording forwarded messages for a stage
+        # G) State: Recording forwarded messages for a stage
         if state and state.startswith("RECORD_STAGE_"):
-            stage_num = int(state.split("_")[-1])
-            pkg_id = active_package_ids.get(user_id)
-            if not pkg_id:
-                pkg_id = int(get_iran_now().timestamp())
-                active_package_ids[user_id] = pkg_id
+            if state == "RECORD_STAGE_4_SOLO":
+                caption = msg.caption or (text[:50] if text else None)
+                database.add_stage_message(
+                    config.DB_PATH,
+                    stage=4,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    caption=caption,
+                    package_id=None
+                )
+                tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
+                await msg.reply_text(
+                    f"✅ **ویس به عنوان نوبت مستقل جدید در بخش ۴ ذخیره شد!** 🟢\n"
+                    f"📊 کل نوبت‌های بخش ۴ تاکنون: **{tot_pkg} نوبت**\n\n"
+                    "*(می‌توانید ویس‌های بعدی را هم فوروارد کنید یا دکمه اتمام ذخیره را بزنید)*",
+                    parse_mode="Markdown",
+                    reply_markup=get_recording_reply_keyboard()
+                )
+                return
 
-            caption = msg.caption or (text[:50] if text else None)
-            database.add_stage_message(
-                config.DB_PATH,
-                stage=stage_num,
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-                caption=caption,
-                package_id=pkg_id
-            )
+            elif state in ("RECORD_STAGE_4_PACKAGE", "RECORD_STAGE_4"):
+                pkg_id = active_package_ids.get(user_id)
+                if not pkg_id:
+                    pkg_id = int(get_iran_now().timestamp())
+                    active_package_ids[user_id] = pkg_id
 
-            conn = database.get_connection(config.DB_PATH)
-            try:
-                cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
-                pkg_cnt = cur.fetchone()["cnt"]
-            finally:
-                conn.close()
+                caption = msg.caption or (text[:50] if text else None)
+                database.add_stage_message(
+                    config.DB_PATH,
+                    stage=4,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    caption=caption,
+                    package_id=pkg_id
+                )
 
-            await msg.reply_text(
-                f"✅ فایل شماره {pkg_cnt} در این بسته آموزشی ذخیره شد 🟢\n"
-                "*(می‌توانید فایل‌های مکمل مثل ویدیو، عکس و ویس را در ادامه فوروارد کنید یا دکمه اتمام را بزنید)*",
-                parse_mode="Markdown",
-                reply_markup=get_recording_reply_keyboard()
-            )
-            return
+                conn = database.get_connection(config.DB_PATH)
+                try:
+                    cur = conn.execute("SELECT COUNT(*) as cnt FROM stage_messages WHERE package_id = ?", (pkg_id,))
+                    pkg_cnt = cur.fetchone()["cnt"]
+                finally:
+                    conn.close()
+
+                await msg.reply_text(
+                    f"✅ فایل شماره {pkg_cnt} در این بسته آموزشی ذخیره شد 🟢\n"
+                    "*(می‌توانید فایل‌های مکمل مثل ویدیو، عکس و ویس را در ادامه فوروارد کنید یا دکمه اتمام را بزنید)*",
+                    parse_mode="Markdown",
+                    reply_markup=get_recording_reply_keyboard()
+                )
+                return
+
+            else:
+                stage_num = int(state.split("_")[-1]) if state.split("_")[-1].isdigit() else 1
+                caption = msg.caption or (text[:50] if text else None)
+                database.add_stage_message(
+                    config.DB_PATH,
+                    stage=stage_num,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    caption=caption
+                )
+                count = len(database.get_stage_messages(config.DB_PATH, stage_num))
+                await msg.reply_text(
+                    f"✅ فایل با موفقیت برای مرحله {stage_num} ذخیره شد 🟢\n"
+                    f"📊 مجموع پیام‌های این مرحله: **{count} پیام**\n"
+                    "*(می‌توانید پیام‌های دیگر را فوروارد کنید یا دکمه اتمام ذخیره را بزنید)*",
+                    parse_mode="Markdown",
+                    reply_markup=get_recording_reply_keyboard()
+                )
+                return
 
     # ==========================
     # 2. STUDENT ACTIONS & BUTTONS
@@ -1503,7 +2077,7 @@ def create_application():
     app = Application.builder().token(config.BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(admin_|stage_|drip_|plan_)"))
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(admin_|stage|drip_|plan_|broadcast_)"))
     app.add_handler(CallbackQueryHandler(student_callback_handler, pattern="^student_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_collector))
 
