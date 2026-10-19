@@ -123,6 +123,17 @@ def init_db(db_path: str) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_delivered_package ON delivered_drip_messages(user_id, package_id);"
                 "CREATE INDEX IF NOT EXISTS idx_deliv_stage_msg ON delivered_messages(user_id, stage, message_record_id);"
                 "CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans(user_id);"
+                "CREATE TABLE IF NOT EXISTS student_dossier ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "user_id INTEGER NOT NULL,"
+                "from_chat_id INTEGER NULL,"
+                "message_id INTEGER NULL,"
+                "media_type TEXT NULL,"
+                "caption TEXT NULL,"
+                "text_content TEXT NULL,"
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ");"
+                "CREATE INDEX IF NOT EXISTS idx_dossier_user ON student_dossier(user_id);"
             )
 
             # Migration column checks for existing databases
@@ -643,6 +654,58 @@ def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
 
 # --- Intro / Rules (Red Lines) Content ---
 
+def set_intro_media(db_path: str, from_chat_id: int, message_id: int, caption: Optional[str] = None) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, updated_at) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "from_chat_id = excluded.from_chat_id, "
+                "message_id = excluded.message_id, "
+                "caption = excluded.caption, "
+                "updated_at = excluded.updated_at",
+                (from_chat_id, message_id, caption, get_now_utc())
+            )
+    finally:
+        conn.close()
+
+def set_intro_rules(db_path: str, text_content: str) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO intro_contents (id, text_content, updated_at) "
+                "VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "text_content = excluded.text_content, "
+                "updated_at = excluded.updated_at",
+                (text_content, get_now_utc())
+            )
+    finally:
+        conn.close()
+
+def clear_intro_media(db_path: str) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE intro_contents SET from_chat_id = NULL, message_id = NULL, caption = NULL WHERE id = 1"
+            )
+    finally:
+        conn.close()
+
+def clear_intro_rules(db_path: str) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE intro_contents SET text_content = NULL WHERE id = 1"
+            )
+    finally:
+        conn.close()
+
 def set_intro_content(db_path: str, from_chat_id: Optional[int] = None, message_id: Optional[int] = None, caption: Optional[str] = None, text_content: Optional[str] = None) -> None:
     conn = get_connection(db_path)
     try:
@@ -675,6 +738,106 @@ def clear_intro_content(db_path: str) -> None:
     try:
         with conn:
             conn.execute("DELETE FROM intro_contents WHERE id = 1")
+    finally:
+        conn.close()
+
+# --- Student Dossier / Memory (Forwarded Notes & Files) ---
+
+def add_student_dossier_note(
+    db_path: str,
+    user_id: int,
+    from_chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    media_type: str = "text",
+    caption: Optional[str] = None,
+    text_content: Optional[str] = None
+) -> int:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO student_dossier (user_id, from_chat_id, message_id, media_type, caption, text_content, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, from_chat_id, message_id, media_type, caption, text_content, get_now_utc())
+            )
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+def get_student_dossier(db_path: str, user_id: int) -> List[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT id, user_id, from_chat_id, message_id, media_type, caption, text_content, created_at "
+            "FROM student_dossier WHERE user_id = ? ORDER BY id ASC",
+            (user_id,)
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def get_student_dossier_count(db_path: str, user_id: int) -> int:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) as cnt FROM student_dossier WHERE user_id = ?",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+def delete_dossier_note(db_path: str, note_id: int) -> bool:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM student_dossier WHERE id = ?", (note_id,))
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+def delete_latest_dossier_note(db_path: str, user_id: int) -> bool:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM student_dossier WHERE id = ("
+                "  SELECT id FROM student_dossier WHERE user_id = ? ORDER BY id DESC LIMIT 1"
+                ")",
+                (user_id,)
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+def clear_student_dossier(db_path: str, user_id: int) -> int:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM student_dossier WHERE user_id = ?", (user_id,))
+            return cur.rowcount
+    finally:
+        conn.close()
+
+def find_students_by_name(db_path: str, query_name: str) -> List[Dict[str, Any]]:
+    if not query_name:
+        return []
+    conn = get_connection(db_path)
+    try:
+        q = query_name.strip().lower()
+        students = list_students(db_path)
+        matched = []
+        for s in students:
+            an = (s.get("assigned_name") or "").lower()
+            fn = (s.get("full_name") or "").lower()
+            un = (s.get("username") or "").lower()
+            if q == an or q == fn or (un and q == un):
+                matched.append(s)
+            elif (an and an in q) or (fn and fn in q) or (q in an) or (q in fn):
+                if s not in matched:
+                    matched.append(s)
+        return matched
     finally:
         conn.close()
 

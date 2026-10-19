@@ -16,10 +16,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Active states: "AWAITING_STUDENT_NAME", "RECORD_STAGE_...", "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT", "AWAITING_INTRO_CONTENT", "AWAITING_BROADCAST_CONTENT"
+# Active states: "AWAITING_STUDENT_NAME", "RECORD_STAGE_...", "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT", "AWAITING_INTRO_MEDIA", "AWAITING_INTRO_RULES", "AWAITING_BROADCAST_CONTENT", "AWAITING_MANUAL_DOSSIER_<user_id>"
 active_states: Dict[int, Optional[str]] = {}
 active_package_ids: Dict[int, int] = {}
 pending_broadcast: Dict[int, Dict[str, Any]] = {}
+pending_dossier_notes: Dict[int, Dict[str, Any]] = {}
 
 try:
     from telegram import (
@@ -80,8 +81,9 @@ def get_admin_reply_keyboard():
         [KeyboardButton("🟣 🎙 افزودن فایل به بخش ۴ 💡"), KeyboardButton("📢 📨 ارسال پیام همگانی (پین‌دار) 📌")],
         [KeyboardButton("📜 📌 پیام خوش‌آمد و خط قرمزها"), KeyboardButton("🟠 🎯 محتوای روز ۸ و ۳۰ 🏆")],
         [KeyboardButton("🟡 🗓 برنامه درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯"), KeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار ⚙️")],
-        [KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈"), KeyboardButton("☀️ 💬 تست جمله انگیزشی ۷ صبح")],
-        [KeyboardButton("💾 دریافت بکاپ دیتابیس 📦"), KeyboardButton("👑 🏠 منوی اصلی مدیریت 👑")]
+        [KeyboardButton("🗂 👤 پرونده و یادداشت‌های دانش‌آموزان"), KeyboardButton("📊 آمار و وضعیت دانش‌آموزان 📈")],
+        [KeyboardButton("☀️ 💬 تست جمله انگیزشی ۷ صبح"), KeyboardButton("💾 دریافت بکاپ دیتابیس 📦")],
+        [KeyboardButton("👑 🏠 منوی اصلی مدیریت 👑")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -115,6 +117,7 @@ def get_admin_main_inline_keyboard():
         [InlineKeyboardButton("🟣 🎙 مدیریت و افزودن فایل به بخش ۴ 💡", callback_data="admin_record_4_menu", style="primary")],
         [InlineKeyboardButton("📢 📨 ارسال پیام همگانی برای همه (با پین) 📌", callback_data="admin_broadcast_menu", style="primary")],
         [InlineKeyboardButton("📜 📌 تنظیم پیام خوش‌آمد و خط قرمزها", callback_data="admin_intro_menu", style="primary")],
+        [InlineKeyboardButton("🗂 👤 پرونده و اطلاعات ذخیره‌شده دانش‌آموزان", callback_data="admin_dossier_menu", style="primary")],
         [InlineKeyboardButton("🟠 🎯 تنظیم محتوای روز ۸ و ۳۰ 🏆", callback_data="admin_milestones_menu", style="primary")],
         [InlineKeyboardButton("🟡 🗓 برنامه‌ریزی درسی دوره‌ای (۷، ۸، ۹ روزه) 🎯", callback_data="admin_plans_menu", style="primary")],
         [InlineKeyboardButton("⚙️ ⏱ تنظیمات ارسال خودکار بخش ۴ ⚙️", callback_data="admin_drip_settings", style="primary")],
@@ -187,14 +190,62 @@ def get_stage_action_keyboard(stage_num: int, has_content: bool = True):
 def get_stage_4_options_keyboard(has_content: bool = True):
     return get_stage_action_keyboard(4, has_content=has_content)
 
-def get_intro_management_keyboard(has_custom: bool = False):
+def get_intro_management_keyboard(has_media: bool = False, has_rules: bool = False):
     keyboard = [
-        [InlineKeyboardButton("👁 📥 مشاهده و پیش‌نمایش پیام فعلی", callback_data="admin_preview_intro", style="success")],
-        [InlineKeyboardButton("✏️ 📝 تنظیم/تغییر پیام (متن، عکس، ویدیو، ویس)", callback_data="admin_edit_intro", style="primary")],
+        [InlineKeyboardButton("👁 📥 پیش‌نمایش کامل پیام دو مرحله‌ای", callback_data="admin_preview_intro", style="success")],
+        [InlineKeyboardButton("🎙 ➕ " + ("تغییر ویس/فایل معرفی" if has_media else "بارگذاری ویس/فایل معرفی"), callback_data="admin_edit_intro_media", style="primary")],
+        [InlineKeyboardButton("📝 ➕ " + ("ویرایش متن خط قرمزها" if has_rules else "تنظیم متن خط قرمزها (اختصاصی)"), callback_data="admin_edit_intro_rules", style="primary")],
     ]
-    if has_custom:
-        keyboard.append([InlineKeyboardButton("🗑 🔄 بازنشانی به متن پیش‌فرض سیستم", callback_data="admin_reset_intro", style="danger")])
+    del_row = []
+    if has_media:
+        del_row.append(InlineKeyboardButton("🗑 حذف ویس/فایل معرفی", callback_data="admin_clear_intro_media", style="danger"))
+    if has_rules:
+        del_row.append(InlineKeyboardButton("🔄 بازنشانی متن قوانین", callback_data="admin_reset_intro_rules", style="danger"))
+    if del_row:
+        keyboard.append(del_row)
     keyboard.append([InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_students_for_dossier_keyboard(students: list):
+    keyboard = []
+    row = []
+    for st in students:
+        uid = st["user_id"]
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        cnt = database.get_student_dossier_count(config.DB_PATH, uid)
+        badge = f" ({cnt} پیام)" if cnt > 0 else ""
+        row.append(InlineKeyboardButton(f"👤 {name}{badge}", callback_data=f"dossier_select_{uid}", style="primary"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔴 🔙 بازگشت به منوی اصلی 🏠", callback_data="admin_menu", style="danger")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_dossier_actions_keyboard(target_user_id: int, has_notes: bool = True):
+    keyboard = []
+    if has_notes:
+        keyboard.append([InlineKeyboardButton("👁 📥 مشاهده تمام پیام‌ها و ویس‌های پرونده", callback_data=f"dossier_view_{target_user_id}", style="success")])
+    keyboard.append([InlineKeyboardButton("➕ 📝 ثبت یادداشت متنی جدید", callback_data=f"dossier_addmanual_{target_user_id}", style="primary")])
+    if has_notes:
+        keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی کامل پرونده این دانش‌آموز", callback_data=f"dossier_clear_{target_user_id}", style="danger")])
+    keyboard.append([InlineKeyboardButton("🔙 👥 بازگشت به لیست پرونده‌ها", callback_data="admin_dossier_menu", style="primary")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_dossier_assign_keyboard(students: list):
+    keyboard = []
+    row = []
+    for st in students:
+        uid = st["user_id"]
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        row.append(InlineKeyboardButton(f"👤 {name}", callback_data=f"dossier_assign_{uid}", style="primary"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ انصراف و عدم ذخیره", callback_data="dossier_assign_cancel", style="danger")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_broadcast_confirm_keyboard():
@@ -559,7 +610,7 @@ async def execute_morning_quotes_cycle(bot, target_user_id: Optional[int] = None
     if not students:
         return 0
 
-    quote_text = motivational_quotes.get_motivational_quote(curr_idx)
+    quote_data = motivational_quotes.get_motivational_quote(curr_idx)
     sent_count = 0
 
     for st in students:
@@ -567,15 +618,7 @@ async def execute_morning_quotes_cycle(bot, target_user_id: Optional[int] = None
             continue
         user_id = st["user_id"]
         raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
-        name = escape_md(raw_name)
-
-        msg_text = (
-            f"☀️ **صبح بخیر {name} عزیز** 🌱✨\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"💬 « **{escape_md(quote_text)}** »\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "🎯 *امروزت رو با آرامش، حس خوب و قدم‌های محکم شروع کن؛ قدم‌به‌قدم تا رسیدن به هدف کنارتم!* 🚀🎓"
-        )
+        msg_text = motivational_quotes.format_morning_message(escape_md(raw_name), quote_data)
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -690,38 +733,38 @@ async def start_handler(update, context):
                 reply_markup=get_student_reply_keyboard(1)
             )
 
-            # Check for Custom Intro / Red Lines Content
+            # Step 1: Send Dr. Hashemi's Intro Voice/Media (if uploaded)
             intro = database.get_intro_content(config.DB_PATH)
-            if intro and (intro.get("message_id") or intro.get("text_content")):
-                if intro.get("message_id") and intro.get("from_chat_id"):
-                    try:
-                        await context.bot.copy_message(
-                            chat_id=user_id,
-                            from_chat_id=intro["from_chat_id"],
-                            message_id=intro["message_id"]
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not copy intro message: {e}")
-                elif intro.get("text_content"):
-                    await update.message.reply_text(
-                        intro["text_content"],
-                        parse_mode="Markdown"
+            if intro and intro.get("message_id") and intro.get("from_chat_id"):
+                try:
+                    await context.bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=intro["from_chat_id"],
+                        message_id=intro["message_id"]
                     )
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"Could not copy intro media message: {e}")
+
+            # Step 2: Send Red Lines and Rules text
+            if intro and intro.get("text_content"):
+                rules_text = intro["text_content"]
             else:
-                default_intro = (
+                rules_text = (
                     "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره:**\n"
                     "━━━━━━━━━━━━━━━━━━━━\n"
                     "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
                     "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
                     "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
                 )
-                await update.message.reply_text(default_intro, parse_mode="Markdown")
 
             start_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🟢 ✅ مطالعه کردم | شروع مرحله اول 🚀", callback_data="student_start_stage_1", style="success")
+                InlineKeyboardButton("🟢 ✅ مطالعه کردم و متعهدم | ورود به مرحله اول 🚀", callback_data="student_start_stage_1", style="success")
             ]])
             await update.message.reply_text(
-                "👇 *لطفاً موارد فوق را با دقت مطالعه نموده و سپس جهت شروع مرحله اول روی دکمه زیر بزنید:*",
+                f"{rules_text}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "👇 *لطفاً موارد فوق را با دقت مطالعه نموده و سپس جهت ورود به مرحله اول روی دکمه زیر بزنید:*",
                 parse_mode="Markdown",
                 reply_markup=start_kb
             )
@@ -1168,59 +1211,96 @@ async def admin_callback_handler(update, context):
     # --- Intro / Red Lines Management ---
     elif data == "admin_intro_menu":
         intro = database.get_intro_content(config.DB_PATH)
-        has_custom = intro is not None
-        st_text = "اختصاصی (تنظیم شده توسط شما) ✅" if has_custom else "متن پیش‌فرض سیستم 📋"
+        has_media = bool(intro and intro.get("message_id"))
+        has_rules = bool(intro and intro.get("text_content"))
+        media_st = "تنظیم شده (فایل اختصاصی) ✅" if has_media else "ثبت نشده ❌"
+        rules_st = "متن اختصاصی شما ✅" if has_rules else "متن پیش‌فرض سیستم 📋"
+
         await query.message.reply_text(
             "📜 **تنظیمات پیام خوش‌آمد و خط قرمزهای مشاوره:** 📌\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "این محتوا قبل از ارسال ویس‌های مرحله اول، به محض ورود دانش‌آموز با لینک دعوت برایش نمایش داده می‌شود تا با آمادگی کامل شروع کند.\n\n"
-            f"• **وضعیت کنونی:** {st_text}\n\n"
-            "جهت مشاهده، ویرایش یا بازنشانی از دکمه‌های زیر استفاده کنید:",
+            "این فرایند به صورت چندمرحله‌ای برای دانش‌آموز جدید ارسال می‌شود:\n"
+            "۱. **مرحله ۱:** ویس یا ویدیوی معرفی دکتر هاشمی\n"
+            "۲. **مرحله ۲:** متن خط قرمزها همراه با دکمه تایید تعهد و ورود به مرحله اول\n\n"
+            f"• **وضعیت فایل/ویس معرفی:** {media_st}\n"
+            f"• **وضعیت متن خط قرمزها:** {rules_st}\n\n"
+            "جهت تنظیم، ویرایش یا پیش‌نمایش از دکمه‌های زیر استفاده کنید:",
             parse_mode="Markdown",
-            reply_markup=get_intro_management_keyboard(has_custom=has_custom)
+            reply_markup=get_intro_management_keyboard(has_media=has_media, has_rules=has_rules)
         )
 
     elif data == "admin_preview_intro":
         intro = database.get_intro_content(config.DB_PATH)
-        if intro and (intro.get("message_id") or intro.get("text_content")):
-            await query.message.reply_text("👁 **پیش‌نمایش پیام خوش‌آمد و خط قرمزهای فعلی شما:**")
-            if intro.get("message_id") and intro.get("from_chat_id"):
-                try:
-                    await context.bot.copy_message(
-                        chat_id=user_id,
-                        from_chat_id=intro["from_chat_id"],
-                        message_id=intro["message_id"]
-                    )
-                except Exception as e:
-                    await query.message.reply_text(f"خطا در ارسال پیش‌نمایش فایل: {e}")
-            elif intro.get("text_content"):
-                await query.message.reply_text(intro["text_content"], parse_mode="Markdown")
-        else:
-            default_intro = (
-                "📌 **توضیحات و خط قرمزهای مهم مشاوره (پیش‌فرض):**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "۱. **تعهد روزانه:** ویس‌ها را در همان روز با تمرکز کامل گوش دهید و یادداشت‌برداری کنید 🌱\n"
-                "۲. **گزارش‌دهی دقیق:** لیست مباحث خوانده‌شده را منظم ارسال کنید تا برنامه جدید برایتان تنظیم شود 📝\n"
-                "۳. **استمرار:** این مسیر تا روز کنکور همراه شماست؛ با تعهد کامل قدم بردارید 🚀✨"
-            )
-            await query.message.reply_text(f"👁 **پیش‌نمایش متن پیش‌فرض سیستم:**\n\n{default_intro}", parse_mode="Markdown")
+        has_media = bool(intro and intro.get("message_id"))
+        rules_text = intro.get("text_content") if (intro and intro.get("text_content")) else (
+            "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره (پیش‌فرض):**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
+            "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
+            "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
+        )
 
-    elif data == "admin_edit_intro":
-        active_states[user_id] = "AWAITING_INTRO_CONTENT"
+        await query.message.reply_text("👁 **پیش‌نمایش مرحله به مرحله پیام خوش‌آمدگویی:**")
+        if has_media:
+            try:
+                await context.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=intro["from_chat_id"],
+                    message_id=intro["message_id"]
+                )
+            except Exception as e:
+                await query.message.reply_text(f"خطا در ارسال فایل معرفی: {e}")
+        else:
+            await query.message.reply_text("ℹ️ *هنوز فایل یا ویس معرفی بارگذاری نشده است (اختیاری).*")
+
+        preview_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🟢 ✅ مطالعه کردم و متعهدم | ورود به مرحله اول 🚀", callback_data="admin_menu", style="success")
+        ]])
         await query.message.reply_text(
-            "📝 **لطفاً پیام خوش‌آمد و خط قرمزهای جدید را ارسال کنید:**\n\n"
-            "می‌توانید یک متن تایپ کنید، یا یک ویس، عکس، ویدیو یا فایل فوروارد نمایید.\n"
+            f"{rules_text}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 *دکمه شروع مرحله اول که دانش‌آموز می‌بیند:*",
+            parse_mode="Markdown",
+            reply_markup=preview_kb
+        )
+
+    elif data == "admin_edit_intro_media":
+        active_states[user_id] = "AWAITING_INTRO_MEDIA"
+        await query.message.reply_text(
+            "🎙 **بارگذاری ویس یا فایل چندرسانه‌ای معرفی:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "لطفاً ویس، ویدیو، عکس یا فایل صوتی مورد نظرتان را در همین چت ارسال یا فوروارد کنید.\n"
+            "این فایل به محض ورود دانش‌آموز به عنوان گام اول برای او فرستاده می‌شود.\n\n"
             "👇 جهت انصراف دکمه زیر را لمس نمایید:",
             parse_mode="Markdown",
             reply_markup=get_recording_reply_keyboard()
         )
 
-    elif data == "admin_reset_intro":
-        database.clear_intro_content(config.DB_PATH)
+    elif data == "admin_edit_intro_rules":
+        active_states[user_id] = "AWAITING_INTRO_RULES"
         await query.message.reply_text(
-            "🗑 **پیام خوش‌آمد و خط قرمزها به حالت پیش‌فرض بازنشانی شد.** 🟢",
+            "📝 **تنظیم متن خط قرمزها و قوانین مشاوره:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "لطفاً متن قوانین را به صورت یک پیام متنی ارسال کنید (می‌توانید همینجا تایپ کنید یا فوروارد نمایید).\n\n"
+            "👇 جهت انصراف دکمه زیر را لمس نمایید:",
             parse_mode="Markdown",
-            reply_markup=get_intro_management_keyboard(has_custom=False)
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data == "admin_clear_intro_media":
+        database.clear_intro_media(config.DB_PATH)
+        await query.message.reply_text(
+            "🗑 **ویس/فایل معرفی حذف شد.**",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
+        )
+
+    elif data == "admin_reset_intro_rules":
+        database.clear_intro_rules(config.DB_PATH)
+        await query.message.reply_text(
+            "🔄 **متن خط قرمزها به حالت پیش‌فرض بازنشانی شد.**",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
         )
 
     # --- Broadcast Management ---
@@ -1375,9 +1455,22 @@ async def admin_callback_handler(update, context):
             status = active_plan["status"]
             plan_info = f"دارای برنامه **{dur} روزه** فعال (وضعیت: {status})"
 
+        dossier = database.get_student_dossier(config.DB_PATH, target_uid)
+        dossier_summary = ""
+        if dossier:
+            dossier_summary = f"\n📁 **خلاصه آخرین موارد پرونده دانش‌آموز ({len(dossier)} مورد ثبت‌شده):**\n"
+            for n in dossier[-4:]:
+                mtype = n.get("media_type") or "متن"
+                t_str = n.get("text_content") or n.get("caption") or f"فایل {mtype}"
+                short_t = (t_str[:50] + "...") if len(t_str) > 50 else t_str
+                dossier_summary += f"• [{mtype}] {escape_md(short_t)}\n"
+            if len(dossier) > 4:
+                dossier_summary += f"*(و {len(dossier) - 4} مورد قدیمی‌تر)*\n"
+
         await query.message.reply_text(
             f"👤 **دانش‌آموز:** {name}\n"
-            f"📊 **وضعیت کنونی:** {plan_info}\n\n"
+            f"📊 **وضعیت کنونی:** {plan_info}\n"
+            f"{dossier_summary}\n"
             f"مدت برنامه جدید را برای «{name}» انتخاب کنید:",
             parse_mode="Markdown",
             reply_markup=get_plan_duration_keyboard(target_uid)
@@ -1421,6 +1514,164 @@ async def admin_callback_handler(update, context):
             "مثلاً بنویسید: `7` یا `8` یا `10`",
             parse_mode="Markdown"
         )
+
+    elif data == "admin_test_quote":
+        await query.message.reply_text("⏳ در حال آماده‌سازی و ارسال نمونه پیام انگیزشی ساعت ۷ صبح...")
+        await execute_morning_quotes_cycle(context.bot, target_user_id=user_id)
+
+    # --- Student Dossier & Memory Management ---
+    elif data == "admin_dossier_menu":
+        students = database.list_students(config.DB_PATH)
+        if not students:
+            await query.message.reply_text("ℹ️ هنوز هیچ دانش‌آموزی در ربات ثبت‌نام نکرده است.")
+            return
+
+        await query.message.reply_text(
+            "🗂 👤 **پرونده و اطلاعات ذخیره‌شده دانش‌آموزان:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "هر پیامی (ویس، ویدیو، عکس، متن) که از چت دانش‌آموز به ربات فوروارد کنید، خودکار در پرونده او ذخیره می‌شود.\n\n"
+            "جهت مشاهده یا ثبت یادداشت دستی، دانش‌آموز مورد نظر را انتخاب کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_students_for_dossier_keyboard(students)
+        )
+
+    elif data.startswith("dossier_select_"):
+        target_uid = int(data.split("_")[-1])
+        st = database.get_student(config.DB_PATH, target_uid)
+        if not st:
+            await query.message.reply_text("❌ دانش‌آموز یافت نشد.")
+            return
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(name)
+        cnt = database.get_student_dossier_count(config.DB_PATH, target_uid)
+        st_info = (
+            f"👤 **پرونده تحصیلی «{safe_name}»**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"• وضعیت مرحله: **مرحله {st['current_stage']}**\n"
+            f"• تعداد کل یادداشت‌ها و فایل‌های ثبت‌شده: **{cnt} مورد**\n\n"
+            "عملیات مورد نظر را انتخاب کنید:"
+        )
+        await query.message.reply_text(
+            st_info,
+            parse_mode="Markdown",
+            reply_markup=get_dossier_actions_keyboard(target_uid, has_notes=(cnt > 0))
+        )
+
+    elif data.startswith("dossier_view_"):
+        target_uid = int(data.split("_")[-1])
+        st = database.get_student(config.DB_PATH, target_uid)
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(name)
+        notes = database.get_student_dossier(config.DB_PATH, target_uid)
+
+        if not notes:
+            await query.message.reply_text(f"ℹ️ پرونده «{safe_name}» در حال حاضر خالی است.")
+            return
+
+        await query.message.reply_text(
+            f"⏳ در حال ارسال محتوای پرونده «{safe_name}» ({len(notes)} مورد)...",
+            parse_mode="Markdown"
+        )
+
+        for idx, n in enumerate(notes, 1):
+            mtype = n.get("media_type") or "text"
+            date_str = str(n.get("created_at") or "")[:16]
+            if n.get("from_chat_id") and n.get("message_id"):
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"📌 **مورد شماره {idx} ({mtype}) - ثبت: `{date_str}`:**",
+                        parse_mode="Markdown"
+                    )
+                    await context.bot.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=n["from_chat_id"],
+                        message_id=n["message_id"]
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    await query.message.reply_text(f"خطا در ارسال فایل شماره {idx}: {e}")
+            elif n.get("text_content"):
+                t_content = escape_md(n.get("text_content"))
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📝 **یادداشت شماره {idx} - ثبت: `{date_str}`:**\n\n{t_content}",
+                    parse_mode="Markdown"
+                )
+                await asyncio.sleep(0.2)
+
+        await query.message.reply_text(
+            f"✅ **پایان محتوای پرونده «{safe_name}»**",
+            parse_mode="Markdown",
+            reply_markup=get_dossier_actions_keyboard(target_uid, has_notes=True)
+        )
+
+    elif data.startswith("dossier_addmanual_"):
+        target_uid = int(data.split("_")[-1])
+        active_states[user_id] = f"AWAITING_MANUAL_DOSSIER_{target_uid}"
+        st = database.get_student(config.DB_PATH, target_uid)
+        name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(name)
+        await query.message.reply_text(
+            f"📝 **ثبت یادداشت دستی برای «{safe_name}»:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "لطفاً متن یادداشت خود را (مثلاً وضعیت درسی، ضعف‌ها یا نقاط قوت) در این چت ارسال نمایید.\n\n"
+            "👇 جهت انصراف دکمه زیر را لمس کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data.startswith("dossier_clear_"):
+        target_uid = int(data.split("_")[-1])
+        database.clear_student_dossier(config.DB_PATH, target_uid)
+        await query.message.reply_text(
+            "🗑 **پرونده این دانش‌آموز با موفقیت کامل پاکسازی شد.** 🟢",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
+        )
+
+    elif data.startswith("dossier_del_"):
+        note_id = int(data.split("_")[-1])
+        database.delete_dossier_note(config.DB_PATH, note_id)
+        await query.message.reply_text("🗑 **این مورد از پرونده دانش‌آموز حذف شد.** 🟢")
+
+    elif data.startswith("dossier_assign_"):
+        if data == "dossier_assign_cancel":
+            pending_dossier_notes.pop(user_id, None)
+            await query.message.reply_text("❌ عملیات ذخیره لغو شد.", reply_markup=get_admin_reply_keyboard())
+        else:
+            target_uid = int(data.split("_")[-1])
+            item = pending_dossier_notes.pop(user_id, None)
+            if not item:
+                await query.message.reply_text("❌ داده مورد نظر منقضی شده یا یافت نشد.")
+            else:
+                note_id = database.add_student_dossier_note(
+                    config.DB_PATH,
+                    user_id=target_uid,
+                    from_chat_id=item.get("from_chat_id"),
+                    message_id=item.get("message_id"),
+                    media_type=item.get("media_type", "text"),
+                    caption=item.get("caption"),
+                    text_content=item.get("text_content")
+                )
+                st = database.get_student(config.DB_PATH, target_uid)
+                name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+                safe_name = escape_md(name)
+                tot = database.get_student_dossier_count(config.DB_PATH, target_uid)
+
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👁 مشاهده کامل پرونده", callback_data=f"dossier_view_{target_uid}", style="success")],
+                    [InlineKeyboardButton("↩️ حذف این پیام از پرونده", callback_data=f"dossier_del_{note_id}", style="danger")],
+                    [InlineKeyboardButton("👑 منوی اصلی مدیریت", callback_data="admin_menu", style="primary")]
+                ])
+                await query.message.reply_text(
+                    f"📁 **پیام با موفقیت در پرونده «{safe_name}» ذخیره شد!** ✅\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• نوع محتوا: **{item.get('media_type', 'text')}**\n"
+                    f"• مجموع موارد پرونده: **{tot} مورد**",
+                    parse_mode="Markdown",
+                    reply_markup=kb
+                )
 
     elif data == "admin_stats":
         report = generate_students_stats_report()
@@ -1550,8 +1801,9 @@ async def message_collector(update, context):
             active_states[user_id] = None
             pkg_id = active_package_ids.pop(user_id, None)
 
-            if curr_state in ("AWAITING_INTRO_CONTENT", "AWAITING_BROADCAST_CONTENT"):
+            if curr_state in ("AWAITING_INTRO_CONTENT", "AWAITING_INTRO_MEDIA", "AWAITING_INTRO_RULES", "AWAITING_BROADCAST_CONTENT") or curr_state.startswith("AWAITING_MANUAL_DOSSIER_"):
                 pending_broadcast.pop(user_id, None)
+                pending_dossier_notes.pop(user_id, None)
                 await msg.reply_text(
                     "❌ **عملیات لغو شد و به منوی اصلی مدیریت بازگشتید.**",
                     parse_mode="Markdown",
@@ -1657,16 +1909,39 @@ async def message_collector(update, context):
         elif "پیام خوش‌آمد و خط قرمزها" in text:
             active_states[user_id] = None
             intro = database.get_intro_content(config.DB_PATH)
-            has_custom = intro is not None
-            st_text = "اختصاصی (تنظیم شده توسط شما) ✅" if has_custom else "متن پیش‌فرض سیستم 📋"
+            has_media = bool(intro and intro.get("message_id"))
+            has_rules = bool(intro and intro.get("text_content"))
+            media_st = "تنظیم شده (فایل اختصاصی) ✅" if has_media else "ثبت نشده ❌"
+            rules_st = "متن اختصاصی شما ✅" if has_rules else "متن پیش‌فرض سیستم 📋"
+
             await msg.reply_text(
                 "📜 **تنظیمات پیام خوش‌آمد و خط قرمزهای مشاوره:** 📌\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "این محتوا قبل از ارسال ویس‌های مرحله اول، به محض ورود دانش‌آموز با لینک دعوت برایش نمایش داده می‌شود تا با آمادگی کامل شروع کند.\n\n"
-                f"• **وضعیت کنونی:** {st_text}\n\n"
-                "جهت مشاهده، ویرایش یا بازنشانی از دکمه‌های زیر استفاده کنید:",
+                "این فرایند به صورت چندمرحله‌ای برای دانش‌آموز جدید ارسال می‌شود:\n"
+                "۱. **مرحله ۱:** ویس یا ویدیوی معرفی دکتر هاشمی\n"
+                "۲. **مرحله ۲:** متن خط قرمزها همراه با دکمه تایید تعهد و ورود به مرحله اول\n\n"
+                f"• **وضعیت فایل/ویس معرفی:** {media_st}\n"
+                f"• **وضعیت متن خط قرمزها:** {rules_st}\n\n"
+                "جهت تنظیم، ویرایش یا پیش‌نمایش از دکمه‌های زیر استفاده کنید:",
                 parse_mode="Markdown",
-                reply_markup=get_intro_management_keyboard(has_custom=has_custom)
+                reply_markup=get_intro_management_keyboard(has_media=has_media, has_rules=has_rules)
+            )
+            return
+
+        elif "پرونده و یادداشت‌های دانش‌آموزان" in text:
+            active_states[user_id] = None
+            students = database.list_students(config.DB_PATH)
+            if not students:
+                await msg.reply_text("ℹ️ هنوز هیچ دانش‌آموزی در ربات ثبت‌نام نکرده است.")
+                return
+
+            await msg.reply_text(
+                "🗂 👤 **پرونده و اطلاعات ذخیره‌شده دانش‌آموزان:**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "جهت مشاهده محتویات پرونده یا ثبت یادداشت دستی، دانش‌آموز مورد نظر را انتخاب کنید:\n"
+                "*(همچنین می‌توانید مستقیماً هر پیامی از دانش‌آموز را به این چت فوروارد کنید تا ذخیره شود)*",
+                parse_mode="Markdown",
+                reply_markup=get_students_for_dossier_keyboard(students)
             )
             return
 
@@ -1764,34 +2039,64 @@ async def message_collector(update, context):
             await msg.reply_text(reply_text, parse_mode="Markdown", reply_markup=get_admin_reply_keyboard())
             return
 
-        # D) State: Waiting for intro/rules content
-        if state == "AWAITING_INTRO_CONTENT":
+        # D1) State: Waiting for intro media
+        if state == "AWAITING_INTRO_MEDIA":
             active_states[user_id] = None
             caption = msg.caption or (text if text else None)
-            is_media = bool(msg.voice or msg.video or msg.photo or msg.audio or msg.document or msg.animation)
-
-            if is_media:
-                database.set_intro_content(
-                    config.DB_PATH,
-                    from_chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                    caption=caption,
-                    text_content=None
-                )
-            else:
-                database.set_intro_content(
-                    config.DB_PATH,
-                    text_content=text,
-                    from_chat_id=None,
-                    message_id=None,
-                    caption=None
-                )
-
+            database.set_intro_media(
+                config.DB_PATH,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                caption=caption
+            )
             await msg.reply_text(
-                "🎉 **پیام خوش‌آمد و خط قرمزهای جدید با موفقیت ذخیره شد!** 🟢✨\n"
-                "از این پس هر دانش‌آموز جدیدی که از طریق لینک دعوت وارد شود، ابتدا این پیام را مشاهده کرده و پس از فشردن دکمه تایید، ویس‌های مرحله اول برایش ارسال خواهد شد.",
+                "🎉 **ویس/فایل معرفی دکتر هاشمی با موفقیت ذخیره شد!** 🟢✨\n"
+                "از این پس هنگام ورود دانش‌آموز جدید با لینک اختصاصی، ابتدا این فایل برای او ارسال خواهد شد.",
                 parse_mode="Markdown",
                 reply_markup=get_admin_reply_keyboard()
+            )
+            return
+
+        # D2) State: Waiting for intro rules text
+        if state == "AWAITING_INTRO_RULES":
+            active_states[user_id] = None
+            rules_text = text if text else (msg.caption or "")
+            database.set_intro_rules(config.DB_PATH, rules_text)
+            await msg.reply_text(
+                "🎉 **متن خط قرمزها و قوانین مشاوره با موفقیت ذخیره شد!** 🟢✨\n"
+                "این متن در گام دوم خوش‌آمدگویی همراه با دکمه تایید تعهد به دانش‌آموز نمایش داده می‌شود.",
+                parse_mode="Markdown",
+                reply_markup=get_admin_reply_keyboard()
+            )
+            return
+
+        # D3) State: Waiting for manual dossier text note
+        if state and state.startswith("AWAITING_MANUAL_DOSSIER_"):
+            target_uid = int(state.split("_")[-1])
+            active_states[user_id] = None
+            st = database.get_student(config.DB_PATH, target_uid)
+            raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+            safe_name = escape_md(raw_name)
+
+            database.add_student_dossier_note(
+                config.DB_PATH,
+                user_id=target_uid,
+                from_chat_id=None,
+                message_id=None,
+                media_type="text",
+                caption=None,
+                text_content=text
+            )
+            tot = database.get_student_dossier_count(config.DB_PATH, target_uid)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("👁 مشاهده کامل پرونده", callback_data=f"dossier_view_{target_uid}", style="success")],
+                [InlineKeyboardButton("👑 منوی اصلی مدیریت", callback_data="admin_menu", style="primary")]
+            ])
+            await msg.reply_text(
+                f"📝 **یادداشت دستی در پرونده «{safe_name}» ثبت شد!** 🟢✨\n"
+                f"📊 مجموع موارد پرونده: **{tot} مورد**",
+                parse_mode="Markdown",
+                reply_markup=kb
             )
             return
 
@@ -1918,6 +2223,129 @@ async def message_collector(update, context):
                     reply_markup=get_recording_reply_keyboard()
                 )
                 return
+
+        # H) Student Dossier Auto-Save from Forwarded Messages
+        is_forwarded = bool(msg.forward_date or msg.forward_from or msg.forward_sender_name or getattr(msg, "forward_origin", None))
+        if is_forwarded:
+            if msg.voice:
+                media_type = "voice"
+            elif msg.audio:
+                media_type = "audio"
+            elif msg.video or msg.video_note:
+                media_type = "video"
+            elif msg.photo:
+                media_type = "photo"
+            elif msg.document:
+                media_type = "document"
+            else:
+                media_type = "text"
+            caption = msg.caption
+            text_content = msg.text
+
+            target_student_id = None
+            sender_name = None
+
+            if msg.forward_from:
+                target_student_id = msg.forward_from.id
+                sender_name = msg.forward_from.full_name
+            elif hasattr(msg, "forward_origin") and msg.forward_origin:
+                orig = msg.forward_origin
+                orig_type = getattr(orig, "type", "")
+                if orig_type == "user" and getattr(orig, "sender_user", None):
+                    target_student_id = orig.sender_user.id
+                    sender_name = orig.sender_user.full_name
+                elif orig_type == "hidden_user":
+                    sender_name = getattr(orig, "sender_user_name", None)
+            elif msg.forward_sender_name:
+                sender_name = msg.forward_sender_name
+
+            # Check 1: Direct match by Telegram User ID
+            if target_student_id:
+                st = database.get_student(config.DB_PATH, target_student_id)
+                if st:
+                    note_id = database.add_student_dossier_note(
+                        config.DB_PATH,
+                        user_id=target_student_id,
+                        from_chat_id=msg.chat_id,
+                        message_id=msg.message_id,
+                        media_type=media_type,
+                        caption=caption,
+                        text_content=text_content
+                    )
+                    st_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+                    safe_name = escape_md(st_name)
+                    tot = database.get_student_dossier_count(config.DB_PATH, target_student_id)
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("👁 مشاهده کامل پرونده", callback_data=f"dossier_view_{target_student_id}", style="success")],
+                        [InlineKeyboardButton("↩️ حذف این پیام از پرونده", callback_data=f"dossier_del_{note_id}", style="danger")],
+                        [InlineKeyboardButton("👑 منوی اصلی مدیریت", callback_data="admin_menu", style="primary")]
+                    ])
+                    await msg.reply_text(
+                        f"📁 **پیام فوروارد شده در پرونده «{safe_name}» ذخیره شد!** ✅\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• نوع محتوا: **{media_type}**\n"
+                        f"• مجموع موارد پرونده این دانش‌آموز: **{tot} مورد**",
+                        parse_mode="Markdown",
+                        reply_markup=kb
+                    )
+                    return
+
+            # Check 2: Match by Sender Name (e.g. forward with privacy)
+            matches = database.find_students_by_name(config.DB_PATH, sender_name) if sender_name else []
+            if len(matches) == 1:
+                matched_st = matches[0]
+                m_uid = matched_st["user_id"]
+                note_id = database.add_student_dossier_note(
+                    config.DB_PATH,
+                    user_id=m_uid,
+                    from_chat_id=msg.chat_id,
+                    message_id=msg.message_id,
+                    media_type=media_type,
+                    caption=caption,
+                    text_content=text_content
+                )
+                st_name = matched_st.get("assigned_name") or matched_st.get("full_name") or "دانش‌آموز"
+                safe_name = escape_md(st_name)
+                tot = database.get_student_dossier_count(config.DB_PATH, m_uid)
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👁 مشاهده کامل پرونده", callback_data=f"dossier_view_{m_uid}", style="success")],
+                    [InlineKeyboardButton("↩️ حذف این پیام از پرونده", callback_data=f"dossier_del_{note_id}", style="danger")],
+                    [InlineKeyboardButton("👑 منوی اصلی مدیریت", callback_data="admin_menu", style="primary")]
+                ])
+                await msg.reply_text(
+                    f"📁 **پیام بر اساس نام فرستنده ({escape_md(sender_name)}) در پرونده «{safe_name}» ذخیره شد!** ✅\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• نوع محتوا: **{media_type}**\n"
+                    f"• مجموع موارد پرونده: **{tot} مورد**",
+                    parse_mode="Markdown",
+                    reply_markup=kb
+                )
+                return
+
+            # Check 3: Ambiguous or unlinked forward -> Ask admin to assign to a student
+            pending_dossier_notes[user_id] = {
+                "from_chat_id": msg.chat_id,
+                "message_id": msg.message_id,
+                "media_type": media_type,
+                "caption": caption,
+                "text_content": text_content,
+                "sender_name": sender_name
+            }
+            all_students = database.list_students(config.DB_PATH)
+            if not all_students:
+                await msg.reply_text("ℹ️ هنوز هیچ دانش‌آموزی در ربات ثبت‌نام نکرده است.")
+                return
+
+            candidates = matches if matches else all_students
+            prompt_name = f" از «{escape_md(sender_name)}»" if sender_name else ""
+            await msg.reply_text(
+                f"📥 **پیام فوروارد شده{prompt_name} دریافت شد.**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "جهت ثبت این پیام در پرونده، لطفاً دانش‌آموز مربوطه را از لیست زیر انتخاب فرمایید:",
+                parse_mode="Markdown",
+                reply_markup=get_dossier_assign_keyboard(candidates)
+            )
+            return
 
     # ==========================
     # 2. STUDENT ACTIONS & BUTTONS
@@ -2077,7 +2505,7 @@ def create_application():
     app = Application.builder().token(config.BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(admin_|stage|drip_|plan_|broadcast_)"))
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(admin_|stage|drip_|plan_|broadcast_|dossier_)"))
     app.add_handler(CallbackQueryHandler(student_callback_handler, pattern="^student_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, message_collector))
 
