@@ -624,26 +624,63 @@ def create_database_backup(db_path: str, backup_path: Optional[str] = None) -> s
     base_name = os.path.basename(db_path)
     if not backup_path:
         backup_path = os.path.join(dir_name, f"backup_{base_name}")
-    
+    if os.path.exists(backup_path) and os.path.abspath(backup_path) != os.path.abspath(db_path):
+        try:
+            os.remove(backup_path)
+        except Exception:
+            pass
+
     src = get_connection(db_path)
-    dst = get_connection(backup_path)
+    dst = None
     try:
+        try:
+            src.execute("PRAGMA wal_checkpoint(FULL);")
+        except Exception:
+            pass
+        dst = sqlite3.connect(backup_path, timeout=30.0)
         with dst:
             src.backup(dst)
+        dst.execute("PRAGMA journal_mode = DELETE;")
+        dst.commit()
     finally:
-        dst.close()
+        if dst:
+            dst.close()
         src.close()
     return backup_path
 
 def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
+    if not os.path.exists(backup_file_path) or os.path.getsize(backup_file_path) == 0:
+        return False
     src = None
     dst = None
     try:
-        src = get_connection(backup_file_path)
-        dst = get_connection(target_db_path)
-        with dst:
-            src.backup(dst)
-        return True
+        # Check if file is a valid SQLite database or an SQL script dump
+        with open(backup_file_path, "rb") as f:
+            header = f.read(16)
+
+        if header.startswith(b"SQLite format 3"):
+            src = sqlite3.connect(backup_file_path, timeout=30.0)
+            # Verify integrity and tables
+            src.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+            dst = sqlite3.connect(target_db_path, timeout=30.0)
+            try:
+                dst.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+            with dst:
+                src.backup(dst)
+            dst.commit()
+            return True
+        else:
+            # Try restoring from SQL text dump if user uploaded a .sql backup
+            with open(backup_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                sql_script = f.read()
+            if "CREATE TABLE" in sql_script.upper() or "INSERT INTO" in sql_script.upper():
+                dst = get_connection(target_db_path)
+                with dst:
+                    dst.executescript(sql_script)
+                return True
+            return False
     except Exception:
         return False
     finally:

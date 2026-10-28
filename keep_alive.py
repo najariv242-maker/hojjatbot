@@ -11,6 +11,15 @@ logger = logging.getLogger(__name__)
 class ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
+    def server_bind(self):
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
+        super().server_bind()
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -21,7 +30,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "application/json; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b'{"status": "ok", "message": "Bot is alive and running 24/7 on Render!"}')
+        self.wfile.write(b'{"status": "ok", "message": "Bot is alive and running 24/7 with Live Hot-Reload!"}')
 
     def log_message(self, format, *args):
         # Silence access logs to keep terminal clean
@@ -43,7 +52,7 @@ def ping_loop(target_url: str, interval: int = 180):
         try:
             req = urllib.request.Request(
                 target_url,
-                headers={"User-Agent": "Render-KeepAlive-Bot/2.0"}
+                headers={"User-Agent": "Workflow-KeepAlive-Bot/2.0"}
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 if resp.status == 200:
@@ -51,12 +60,12 @@ def ping_loop(target_url: str, interval: int = 180):
         except Exception as e:
             logger.warning(f"Keep-alive ping to {target_url} notice: {e}")
 
-def start_keep_alive(port: int = 10000, ping_url: str = ""):
-    # 1. Start HTTP server thread for Render Web Service binding
+def start_keep_alive(port: int = 7860, ping_url: str = ""):
+    # 1. Start HTTP server thread on port 7860
     server_thread = threading.Thread(target=run_http_server, args=(port,), daemon=True)
     server_thread.start()
 
-    # 2. Determine target URL: check parameter or RENDER_EXTERNAL_URL environment variable
+    # 2. Determine target URL: check parameter or RENDER_EXTERNAL_URL / PING_URL environment variable
     url_to_ping = ping_url or os.getenv("RENDER_EXTERNAL_URL", os.getenv("PING_URL", "")).strip()
 
     if url_to_ping:
@@ -68,4 +77,3 @@ def start_keep_alive(port: int = 10000, ping_url: str = ""):
         local_url = f"http://127.0.0.1:{port}/"
         ping_thread = threading.Thread(target=ping_loop, args=(local_url, 180), daemon=True)
         ping_thread.start()
-

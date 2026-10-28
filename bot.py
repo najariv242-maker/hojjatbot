@@ -595,7 +595,7 @@ async def execute_morning_quotes_cycle(bot, target_user_id: Optional[int] = None
         if st_obj:
             students = [st_obj]
         else:
-            students = [{"user_id": target_user_id, "full_name": "مدیر محترم", "assigned_name": "دکتر هاشمی"}]
+            students = [{"user_id": target_user_id, "full_name": "محمد", "assigned_name": "محمد"}]
         try:
             curr_idx = int(database.get_setting(config.DB_PATH, "test_morning_quote_index", "0"))
         except ValueError:
@@ -693,7 +693,7 @@ async def send_database_backup_file(bot, chat_id: int):
                     "💾 **نسخه پشتیبان کامل دیتابیس ربات** 📦\n\n"
                     f"🗓 تاریخ بکاپ: `{now_str}`\n"
                     "📌 **شامل:** کلیه اطلاعات دانش‌آموزان، مراحل، فایل‌های ذخیره‌شده و تنظیمات زمان‌بندی.\n\n"
-                    "💡 *در صورت نیاز به بازیابی اطلاعات (مثلاً پس از ویرایش و ری‌استارت رندر)، کافیست همین فایل `.db` را در پی‌وی برای ربات بفرستید.*"
+                    "💡 *هر زمان که نیاز به بازیابی یا انتقال اطلاعات داشتید، کافیست همین فایل پشتیبان (`.db`) را مستقیماً در پی‌وی برای ربات بفرستید تا بلافاصله پشتیبانی و جایگزین شود.*"
                 ),
                 parse_mode="Markdown"
             )
@@ -1763,37 +1763,53 @@ async def message_collector(update, context):
     # 1. ADMIN ACTIONS & BUTTONS
     # ==========================
     if is_admin(user_id, username):
-        # Database restore document handler (Admin sends .db file)
+        # Database restore document handler (Admin sends .db / .sqlite / .sqlite3 / .bak / .sql backup file)
+        # Only intercept when NOT actively recording stage/broadcast/intro/dossier files, OR when filename explicitly ends with a DB extension
+        curr_admin_state = active_states.get(user_id) or ""
+        is_recording_media = (
+            curr_admin_state.startswith("RECORD_STAGE_")
+            or curr_admin_state in ("AWAITING_INTRO_MEDIA", "AWAITING_BROADCAST_CONTENT")
+        )
         if msg.document:
-            file_name = msg.document.file_name or ""
-            if file_name.lower().endswith(".db"):
-                await msg.reply_text("⏳ در حال دریافت و بررسی فایل دیتابیس برای بازیابی...")
-                try:
-                    doc_file = await msg.document.get_file()
-                    dir_name = os.path.dirname(config.DB_PATH) or "."
-                    temp_restore_path = os.path.join(dir_name, "temp_restore.db")
-                    await doc_file.download_to_drive(custom_path=temp_restore_path)
+            file_name = (msg.document.file_name or "").lower()
+            is_db_ext = file_name.endswith((".db", ".sqlite", ".sqlite3", ".bak", ".sql"))
+            if is_db_ext or (not is_recording_media and not msg.forward_date and not getattr(msg, "forward_origin", None)):
+                if is_db_ext:
+                    await msg.reply_text("⏳ در حال دریافت و بررسی فایل پشتیبان دیتابیس برای بازیابی...")
+                    try:
+                        doc_file = await msg.document.get_file()
+                        dir_name = os.path.dirname(config.DB_PATH) or "."
+                        temp_restore_path = os.path.join(dir_name, "temp_restore.db")
+                        await doc_file.download_to_drive(custom_path=temp_restore_path)
 
-                    success = database.restore_database_backup(temp_restore_path, config.DB_PATH)
-                    if os.path.exists(temp_restore_path):
-                        os.remove(temp_restore_path)
+                        success = database.restore_database_backup(temp_restore_path, config.DB_PATH)
+                        if os.path.exists(temp_restore_path):
+                            os.remove(temp_restore_path)
 
-                    if success:
-                        database.init_db(config.DB_PATH)
-                        st_count = len(database.list_students(config.DB_PATH))
-                        await msg.reply_text(
-                            "🎉 **دیتابیس با موفقیت کامل بازیابی شد!** 🟢✨\n\n"
-                            f"👥 تعداد دانش‌آموزان بازیابی‌شده: **{st_count} نفر**\n"
-                            "تمام مراحل، فایل‌های ذخیره‌شده و تنظیمات به طور کامل بازگردانده شدند 🚀",
-                            parse_mode="Markdown",
-                            reply_markup=get_admin_reply_keyboard()
-                        )
-                    else:
-                        await msg.reply_text("❌ خطا در بازیابی دیتابیس. فایل نامعتبر است.")
-                except Exception as e:
-                    logger.error(f"Error restoring db from document: {e}")
-                    await msg.reply_text(f"❌ خطا در پردازش فایل دیتابیس: {e}")
-                return
+                        if success:
+                            database.init_db(config.DB_PATH)
+                            st_count = len(database.list_students(config.DB_PATH))
+                            c1 = len(database.get_stage_messages(config.DB_PATH, 1))
+                            c2 = len(database.get_stage_messages(config.DB_PATH, 2))
+                            c3 = len(database.get_stage_messages(config.DB_PATH, 3))
+                            pkg4 = database.get_stage_4_package_count(config.DB_PATH)
+                            await msg.reply_text(
+                                "🎉 **فایل پشتیبان دیتابیس با موفقیت کامل بازیابی و جایگزین شد!** 🟢✨\n"
+                                "━━━━━━━━━━━━━━━━━━━━\n"
+                                f"👥 دانش‌آموزان بازیابی‌شده: **{st_count} نفر**\n"
+                                f"🎓 مرحله ۱: **{c1} فایل** | مرحله ۲: **{c2} فایل** | مرحله ۳: **{c3} فایل**\n"
+                                f"💡 بخش ۴: **{pkg4} نوبت/بسته آموزشی**\n"
+                                "━━━━━━━━━━━━━━━━━━━━\n"
+                                "✅ تمام اطلاعات، پرونده‌ها، برنامه‌های درسی و تنظیمات بدون هیچ نقصی فعال شدند 🚀",
+                                parse_mode="Markdown",
+                                reply_markup=get_admin_reply_keyboard()
+                            )
+                        else:
+                            await msg.reply_text("❌ خطا در بازیابی دیتابیس. فایل ارسالی یک دیتابیس معتبر SQLite نیست.")
+                    except Exception as e:
+                        logger.error(f"Error restoring db from document: {e}")
+                        await msg.reply_text(f"❌ خطا در پردازش فایل پشتیبان دیتابیس: {e}")
+                    return
 
         # A) Stop recording button (checked first)
         if "اتمام ذخیره پیام‌ها" in text or "انصراف و بازگشت" in text:
