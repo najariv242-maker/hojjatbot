@@ -1,5 +1,7 @@
 import os
+import re
 import sqlite3
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -31,6 +33,35 @@ def parse_db_datetime(val: Any) -> Optional[datetime]:
     except Exception:
         return None
 
+def normalize_persian_text(text: Optional[str]) -> str:
+    """Normalizes Persian/Arabic characters and whitespace for accurate name matching."""
+    if not text:
+        return ""
+    s = str(text).strip().lower()
+    replacements = {
+        "ي": "ی",
+        "ى": "ی",
+        "ئ": "ی",
+        "ك": "ک",
+        "آ": "ا",
+        "أ": "ا",
+        "إ": "ا",
+        "ٱ": "ا",
+        "ؤ": "و",
+        "ة": "ه",
+        "ۀ": "ه",
+        "\u200c": " ",
+        "\u200f": "",
+        "\u200e": "",
+        "_": " ",
+        "-": " ",
+        "‌": " ",
+    }
+    for src, dst in replacements.items():
+        s = s.replace(src, dst)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def get_connection(db_path: str) -> sqlite3.Connection:
     dir_name = os.path.dirname(db_path)
     if dir_name:
@@ -38,7 +69,10 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 def init_db(db_path: str) -> None:
@@ -86,6 +120,8 @@ def init_db(db_path: str) -> None:
                 "user_id INTEGER NOT NULL,"
                 "message_record_id INTEGER NOT NULL,"
                 "package_id INTEGER NULL,"
+                "from_chat_id INTEGER NULL,"
+                "source_message_id INTEGER NULL,"
                 "delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
                 "UNIQUE(user_id, message_record_id)"
                 ");"
@@ -115,14 +151,32 @@ def init_db(db_path: str) -> None:
                 "user_id INTEGER NOT NULL,"
                 "stage INTEGER NOT NULL,"
                 "message_record_id INTEGER NOT NULL,"
+                "from_chat_id INTEGER NULL,"
+                "source_message_id INTEGER NULL,"
                 "delivered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
                 "UNIQUE(user_id, message_record_id)"
+                ");"
+                "CREATE TABLE IF NOT EXISTS student_sent_messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "user_id INTEGER NOT NULL,"
+                "sent_message_id INTEGER NOT NULL,"
+                "content_type TEXT DEFAULT 'voice',"
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                "UNIQUE(user_id, sent_message_id)"
+                ");"
+                "CREATE TABLE IF NOT EXISTS removed_students ("
+                "user_id INTEGER PRIMARY KEY,"
+                "full_name TEXT NULL,"
+                "assigned_name TEXT NULL,"
+                "username TEXT NULL,"
+                "removed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE INDEX IF NOT EXISTS idx_stage ON stage_messages(stage);"
                 "CREATE INDEX IF NOT EXISTS idx_stage_pkg ON stage_messages(stage, package_id);"
                 "CREATE INDEX IF NOT EXISTS idx_delivered_package ON delivered_drip_messages(user_id, package_id);"
                 "CREATE INDEX IF NOT EXISTS idx_deliv_stage_msg ON delivered_messages(user_id, stage, message_record_id);"
                 "CREATE INDEX IF NOT EXISTS idx_study_plans_user ON study_plans(user_id);"
+                "CREATE INDEX IF NOT EXISTS idx_sent_msgs_user ON student_sent_messages(user_id);"
                 "CREATE TABLE IF NOT EXISTS student_dossier ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 "user_id INTEGER NOT NULL,"
@@ -152,7 +206,11 @@ def init_db(db_path: str) -> None:
 
             for col_def, tbl in [
                 ("package_id INTEGER NULL", "stage_messages"),
-                ("package_id INTEGER NULL", "delivered_drip_messages")
+                ("package_id INTEGER NULL", "delivered_drip_messages"),
+                ("from_chat_id INTEGER NULL", "delivered_drip_messages"),
+                ("source_message_id INTEGER NULL", "delivered_drip_messages"),
+                ("from_chat_id INTEGER NULL", "delivered_messages"),
+                ("source_message_id INTEGER NULL", "delivered_messages"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col_def};")
@@ -168,6 +226,23 @@ def init_db(db_path: str) -> None:
             # Backfill package_id for existing stage_messages
             try:
                 conn.execute("UPDATE stage_messages SET package_id = id WHERE package_id IS NULL;")
+            except sqlite3.OperationalError:
+                pass
+
+            # Backfill source_message_id and from_chat_id in delivered_messages & delivered_drip_messages
+            try:
+                conn.execute(
+                    "UPDATE delivered_messages SET "
+                    "from_chat_id = (SELECT sm.from_chat_id FROM stage_messages sm WHERE sm.id = delivered_messages.message_record_id), "
+                    "source_message_id = (SELECT sm.message_id FROM stage_messages sm WHERE sm.id = delivered_messages.message_record_id) "
+                    "WHERE source_message_id IS NULL AND message_record_id > 0;"
+                )
+                conn.execute(
+                    "UPDATE delivered_drip_messages SET "
+                    "from_chat_id = (SELECT sm.from_chat_id FROM stage_messages sm WHERE sm.id = delivered_drip_messages.message_record_id), "
+                    "source_message_id = (SELECT sm.message_id FROM stage_messages sm WHERE sm.id = delivered_drip_messages.message_record_id) "
+                    "WHERE source_message_id IS NULL AND message_record_id > 0;"
+                )
             except sqlite3.OperationalError:
                 pass
 
@@ -236,6 +311,9 @@ def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Opt
                 (user_id, now, code)
             )
 
+            # Remove from removed_students if re-invited with a fresh invite link
+            conn.execute("DELETE FROM removed_students WHERE user_id = ?", (user_id,))
+
             conn.execute(
                 "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, day_8_sent, day_30_sent) "
                 "VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0) "
@@ -259,6 +337,71 @@ def get_student(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
         )
         row = cur.fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+def is_student_removed(db_path: str, user_id: int) -> bool:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT 1 FROM removed_students WHERE user_id = ? LIMIT 1", (user_id,))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+def record_student_sent_message(db_path: str, user_id: int, sent_message_id: int, content_type: str = "voice") -> None:
+    if not user_id or not sent_message_id:
+        return
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO student_sent_messages (user_id, sent_message_id, content_type, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, sent_message_id, content_type, get_now_utc())
+            )
+    finally:
+        conn.close()
+
+def get_student_sent_messages(db_path: str, user_id: int) -> List[int]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT sent_message_id FROM student_sent_messages WHERE user_id = ? ORDER BY sent_message_id DESC",
+            (user_id,)
+        )
+        return [row["sent_message_id"] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def delete_student_completely(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
+    """Deletes a student and all their capabilities, study plans, delivery logs, and dossier records."""
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "SELECT user_id, username, full_name, assigned_name, current_stage FROM students WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cur.fetchone()
+            student = dict(row) if row else None
+
+            conn.execute(
+                "INSERT OR REPLACE INTO removed_students (user_id, full_name, assigned_name, username, removed_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    student.get("full_name") if student else None,
+                    student.get("assigned_name") if student else None,
+                    student.get("username") if student else None,
+                    get_now_utc(),
+                )
+            )
+            conn.execute("DELETE FROM students WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM study_plans WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM student_dossier WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM delivered_messages WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM delivered_drip_messages WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM student_sent_messages WHERE user_id = ?", (user_id,))
+            conn.execute("UPDATE invites SET is_used = 1 WHERE used_by = ?", (user_id,))
+            return student
     finally:
         conn.close()
 
@@ -355,6 +498,14 @@ def add_stage_message(db_path: str, stage: int, from_chat_id: int, message_id: i
     conn = get_connection(db_path)
     try:
         with conn:
+            # Prevent duplicate upload of the exact same message in the same stage
+            existing = conn.execute(
+                "SELECT id FROM stage_messages WHERE stage = ? AND from_chat_id = ? AND message_id = ? LIMIT 1",
+                (stage, from_chat_id, message_id)
+            ).fetchone()
+            if existing:
+                return existing["id"]
+
             cur = conn.execute(
                 "INSERT INTO stage_messages (stage, from_chat_id, message_id, caption, package_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (stage, from_chat_id, message_id, caption, package_id, get_now_utc())
@@ -398,6 +549,7 @@ def clear_stage_messages(db_path: str, stage: int) -> int:
         conn.close()
 
 def get_stage_packages(db_path: str, stage: int = 4) -> List[List[Dict[str, Any]]]:
+    """Returns packages strictly ordered by their first message's insertion order (id ASC), with messages inside each package also ordered by id ASC."""
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
@@ -441,37 +593,100 @@ def get_student_count_by_stage(db_path: str) -> Dict[int, int]:
     finally:
         conn.close()
 
-def get_next_unsent_drip_package(db_path: str, user_id: int) -> Optional[List[Dict[str, Any]]]:
+# --- Generic & Stage 4 Delivered Message Tracking (Strict Duplicate Prevention) ---
+
+def record_message_delivery(
+    db_path: str,
+    user_id: int,
+    stage: int,
+    message_record_id: int,
+    from_chat_id: Optional[int] = None,
+    source_message_id: Optional[int] = None
+) -> None:
     conn = get_connection(db_path)
     try:
-        cur = conn.execute(
-            "SELECT DISTINCT COALESCE(package_id, id) AS pkg_id "
-            "FROM stage_messages sm "
-            "WHERE sm.stage = 4 "
-            "  AND NOT EXISTS ( "
-            "    SELECT 1 FROM delivered_drip_messages ddm "
-            "    WHERE ddm.user_id = ? AND COALESCE(ddm.package_id, ddm.message_record_id) = COALESCE(sm.package_id, sm.id) "
-            "  ) "
-            "ORDER BY pkg_id ASC "
-            "LIMIT 1",
-            (user_id,)
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
+        with conn:
+            if (from_chat_id is None or source_message_id is None) and message_record_id > 0:
+                row = conn.execute(
+                    "SELECT from_chat_id, message_id FROM stage_messages WHERE id = ?",
+                    (message_record_id,)
+                ).fetchone()
+                if row:
+                    from_chat_id = row["from_chat_id"]
+                    source_message_id = row["message_id"]
 
-        pkg_id = row["pkg_id"]
-        cur_items = conn.execute(
-            "SELECT id, stage, from_chat_id, message_id, caption, package_id, created_at "
-            "FROM stage_messages "
-            "WHERE stage = 4 AND COALESCE(package_id, id) = ? "
-            "ORDER BY id ASC",
-            (pkg_id,)
-        )
-        msgs = [dict(r) for r in cur_items.fetchall()]
-        return msgs if msgs else None
+            conn.execute(
+                "INSERT INTO delivered_messages (user_id, stage, message_record_id, from_chat_id, source_message_id, delivered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, message_record_id) DO UPDATE SET "
+                "from_chat_id = COALESCE(excluded.from_chat_id, delivered_messages.from_chat_id), "
+                "source_message_id = COALESCE(excluded.source_message_id, delivered_messages.source_message_id)",
+                (user_id, stage, message_record_id, from_chat_id, source_message_id, get_now_utc())
+            )
     finally:
         conn.close()
+
+def is_message_delivered(
+    db_path: str,
+    user_id: int,
+    message_record_id: int,
+    from_chat_id: Optional[int] = None,
+    source_message_id: Optional[int] = None
+) -> bool:
+    conn = get_connection(db_path)
+    try:
+        if message_record_id is not None and message_record_id > 0:
+            cur = conn.execute(
+                "SELECT 1 FROM delivered_messages WHERE user_id = ? AND message_record_id = ? "
+                "UNION ALL "
+                "SELECT 1 FROM delivered_drip_messages WHERE user_id = ? AND message_record_id = ? "
+                "LIMIT 1",
+                (user_id, message_record_id, user_id, message_record_id)
+            )
+            if cur.fetchone() is not None:
+                return True
+
+            if from_chat_id is None or source_message_id is None:
+                sm_row = conn.execute(
+                    "SELECT from_chat_id, message_id FROM stage_messages WHERE id = ?",
+                    (message_record_id,)
+                ).fetchone()
+                if sm_row:
+                    from_chat_id = sm_row["from_chat_id"]
+                    source_message_id = sm_row["message_id"]
+
+        if from_chat_id is not None and source_message_id is not None:
+            cur2 = conn.execute(
+                "SELECT 1 FROM delivered_messages WHERE user_id = ? AND from_chat_id = ? AND source_message_id = ? "
+                "UNION ALL "
+                "SELECT 1 FROM delivered_drip_messages WHERE user_id = ? AND from_chat_id = ? AND source_message_id = ? "
+                "LIMIT 1",
+                (user_id, from_chat_id, source_message_id, user_id, from_chat_id, source_message_id)
+            )
+            if cur2.fetchone() is not None:
+                return True
+
+        return False
+    finally:
+        conn.close()
+
+def get_next_unsent_drip_package(db_path: str, user_id: int) -> Optional[List[Dict[str, Any]]]:
+    """Returns the next unsent Stage 4 package in strict creation order (id ASC), filtering out any already-delivered files."""
+    packages = get_stage_packages(db_path, stage=4)
+    for pkg in packages:
+        unsent_msgs = [
+            m for m in pkg
+            if not is_message_delivered(
+                db_path,
+                user_id,
+                m["id"],
+                m.get("from_chat_id"),
+                m.get("message_id")
+            )
+        ]
+        if unsent_msgs:
+            return unsent_msgs
+    return None
 
 def get_next_unsent_drip_message(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
     pkg = get_next_unsent_drip_package(db_path, user_id)
@@ -483,9 +698,29 @@ def record_drip_package_delivery(db_path: str, user_id: int, package_id: int, me
         with conn:
             now = get_now_utc()
             for msg_id in message_ids:
+                row = conn.execute(
+                    "SELECT from_chat_id, message_id FROM stage_messages WHERE id = ?",
+                    (msg_id,)
+                ).fetchone()
+                f_chat = row["from_chat_id"] if row else None
+                s_msg = row["message_id"] if row else None
+
                 conn.execute(
-                    "INSERT OR IGNORE INTO delivered_drip_messages (user_id, message_record_id, package_id, delivered_at) VALUES (?, ?, ?, ?)",
-                    (user_id, msg_id, package_id, now)
+                    "INSERT INTO delivered_drip_messages (user_id, message_record_id, package_id, from_chat_id, source_message_id, delivered_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id, message_record_id) DO UPDATE SET "
+                    "package_id = excluded.package_id, "
+                    "from_chat_id = COALESCE(excluded.from_chat_id, delivered_drip_messages.from_chat_id), "
+                    "source_message_id = COALESCE(excluded.source_message_id, delivered_drip_messages.source_message_id)",
+                    (user_id, msg_id, package_id, f_chat, s_msg, now)
+                )
+                conn.execute(
+                    "INSERT INTO delivered_messages (user_id, stage, message_record_id, from_chat_id, source_message_id, delivered_at) "
+                    "VALUES (?, 4, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id, message_record_id) DO UPDATE SET "
+                    "from_chat_id = COALESCE(excluded.from_chat_id, delivered_messages.from_chat_id), "
+                    "source_message_id = COALESCE(excluded.source_message_id, delivered_messages.source_message_id)",
+                    (user_id, msg_id, f_chat, s_msg, now)
                 )
             conn.execute(
                 "UPDATE students SET last_drip_sent_at = ? WHERE user_id = ?",
@@ -503,35 +738,37 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
         interval_days = int(get_setting(db_path, "drip_interval_days", "2"))
         cur = conn.execute(
             "SELECT user_id, username, full_name, assigned_name, current_stage, last_drip_sent_at FROM students "
-            "WHERE current_stage >= 4"
+            "WHERE current_stage >= 4 "
+            "ORDER BY registered_at ASC, user_id ASC"
         )
         candidates = [dict(row) for row in cur.fetchall()]
-        eligible = []
-        now = get_now_utc()
-
-        for st in candidates:
-            next_pkg = get_next_unsent_drip_package(db_path, st["user_id"])
-            if not next_pkg:
-                continue
-
-            if force_ignore_interval:
-                eligible.append((st, next_pkg))
-                continue
-
-            last_sent_str = st.get("last_drip_sent_at")
-            if not last_sent_str:
-                eligible.append((st, next_pkg))
-            else:
-                last_sent = parse_db_datetime(last_sent_str)
-                if not last_sent:
-                    eligible.append((st, next_pkg))
-                else:
-                    diff_days = (now - last_sent).total_seconds() / 86400.0
-                    if diff_days >= interval_days:
-                        eligible.append((st, next_pkg))
-        return eligible
     finally:
         conn.close()
+
+    eligible = []
+    now = get_now_utc()
+
+    for st in candidates:
+        next_pkg = get_next_unsent_drip_package(db_path, st["user_id"])
+        if not next_pkg:
+            continue
+
+        if force_ignore_interval:
+            eligible.append((st, next_pkg))
+            continue
+
+        last_sent_str = st.get("last_drip_sent_at")
+        if not last_sent_str:
+            eligible.append((st, next_pkg))
+        else:
+            last_sent = parse_db_datetime(last_sent_str)
+            if not last_sent:
+                eligible.append((st, next_pkg))
+            else:
+                diff_days = (now - last_sent).total_seconds() / 86400.0
+                if diff_days >= interval_days:
+                    eligible.append((st, next_pkg))
+    return eligible
 
 # --- Study Plans (Periodic 7-day, 8-day, 9-day schedules) ---
 
@@ -857,50 +1094,103 @@ def clear_student_dossier(db_path: str, user_id: int) -> int:
     finally:
         conn.close()
 
+def _compute_name_similarity(query_norm: str, target_norm: str) -> Tuple[float, str]:
+    if not query_norm or not target_norm:
+        return 0.0, "none"
+    if query_norm == target_norm:
+        return 1.0, "exact"
+
+    # Substring or prefix match
+    if query_norm in target_norm or target_norm in query_norm:
+        ratio = min(len(query_norm), len(target_norm)) / max(len(query_norm), len(target_norm), 1)
+        return 0.85 + 0.14 * ratio, "substring"
+
+    # Token-level prefix/substring/fuzzy match
+    q_tokens = query_norm.split()
+    t_tokens = target_norm.split()
+    best_tok_score = 0.0
+    for qt in q_tokens:
+        for tt in t_tokens:
+            if qt == tt:
+                best_tok_score = max(best_tok_score, 0.92)
+            elif qt in tt or tt in qt:
+                r = min(len(qt), len(tt)) / max(len(qt), len(tt), 1)
+                best_tok_score = max(best_tok_score, 0.80 + 0.10 * r)
+            else:
+                sim = SequenceMatcher(None, qt, tt).ratio()
+                best_tok_score = max(best_tok_score, sim * 0.85)
+
+    full_sim = SequenceMatcher(None, query_norm, target_norm).ratio()
+    score = max(full_sim, best_tok_score)
+    match_type = "substring" if score >= 0.80 else "fuzzy"
+    return score, match_type
+
+def find_closest_students_by_name(db_path: str, query_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Finds students matching a full, partial, or fuzzy name query, ordered from closest to furthest."""
+    q = normalize_persian_text(query_name)
+    if not q:
+        return []
+
+    students = list_students(db_path)
+    if not students:
+        return []
+
+    scored: List[Dict[str, Any]] = []
+    for s in students:
+        an = normalize_persian_text(s.get("assigned_name"))
+        fn = normalize_persian_text(s.get("full_name"))
+        un = normalize_persian_text((s.get("username") or "").lstrip("@"))
+
+        best_score = 0.0
+        best_type = "none"
+        for candidate in (an, fn, un):
+            if not candidate:
+                continue
+            sc, mtype = _compute_name_similarity(q, candidate)
+            if sc > best_score:
+                best_score = sc
+                best_type = mtype
+
+        item = dict(s)
+        item["match_score"] = round(best_score, 4)
+        item["match_type"] = best_type
+        scored.append(item)
+
+    scored.sort(key=lambda x: x["match_score"], reverse=True)
+
+    exact = [x for x in scored if x["match_type"] == "exact"]
+    if exact:
+        return exact
+
+    substring = [x for x in scored if x["match_type"] == "substring"]
+    if substring:
+        return substring[:limit]
+
+    fuzzy = [x for x in scored if x["match_score"] >= 0.40]
+    if fuzzy:
+        return fuzzy[:limit]
+
+    # Fallback: return top closest candidates so admin can still pick
+    return scored[: min(3, len(scored))]
+
 def find_students_by_name(db_path: str, query_name: str) -> List[Dict[str, Any]]:
     if not query_name:
         return []
-    conn = get_connection(db_path)
-    try:
-        q = query_name.strip().lower()
-        students = list_students(db_path)
-        matched = []
-        for s in students:
-            an = (s.get("assigned_name") or "").lower()
-            fn = (s.get("full_name") or "").lower()
-            un = (s.get("username") or "").lower()
-            if q == an or q == fn or (un and q == un):
+    q = normalize_persian_text(query_name)
+    if not q:
+        return []
+    students = list_students(db_path)
+    matched = []
+    for s in students:
+        an = normalize_persian_text(s.get("assigned_name"))
+        fn = normalize_persian_text(s.get("full_name"))
+        un = normalize_persian_text((s.get("username") or "").lstrip("@"))
+        if q == an or q == fn or (un and q == un):
+            matched.append(s)
+        elif (an and (an in q or q in an)) or (fn and (fn in q or q in fn)):
+            if s not in matched:
                 matched.append(s)
-            elif (an and an in q) or (fn and fn in q) or (q in an) or (q in fn):
-                if s not in matched:
-                    matched.append(s)
-        return matched
-    finally:
-        conn.close()
-
-# --- Generic Stage Delivered Message Tracking (Duplicate Prevention) ---
-
-def record_message_delivery(db_path: str, user_id: int, stage: int, message_record_id: int) -> None:
-    conn = get_connection(db_path)
-    try:
-        with conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO delivered_messages (user_id, stage, message_record_id, delivered_at) VALUES (?, ?, ?, ?)",
-                (user_id, stage, message_record_id, get_now_utc())
-            )
-    finally:
-        conn.close()
-
-def is_message_delivered(db_path: str, user_id: int, message_record_id: int) -> bool:
-    conn = get_connection(db_path)
-    try:
-        cur = conn.execute(
-            "SELECT 1 FROM delivered_messages WHERE user_id = ? AND message_record_id = ? LIMIT 1",
-            (user_id, message_record_id)
-        )
-        return cur.fetchone() is not None
-    finally:
-        conn.close()
+    return matched
 
 # --- Section 4 Specific Package Queries ---
 
@@ -920,28 +1210,43 @@ def get_stage_4_packages_summary(db_path: str) -> List[Dict[str, Any]]:
     return summary
 
 def get_students_missing_stage_4_package(db_path: str, package_id: int) -> List[Dict[str, Any]]:
+    packages = get_stage_4_packages_summary(db_path)
+    target_pkg = next((p for p in packages if p["package_id"] == package_id), None)
+    if not target_pkg:
+        return []
+
+    pkg_msgs = target_pkg["messages"]
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
             "SELECT user_id, username, full_name, assigned_name FROM students "
-            "WHERE current_stage >= 4 "
-            "  AND NOT EXISTS ("
-            "    SELECT 1 FROM delivered_drip_messages "
-            "    WHERE user_id = students.user_id AND package_id = ?"
-            "  )",
-            (package_id,)
+            "WHERE current_stage >= 4 ORDER BY registered_at ASC, user_id ASC"
         )
-        return [dict(row) for row in cur.fetchall()]
+        candidates = [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
+
+    missing = []
+    for st in candidates:
+        uid = st["user_id"]
+        has_unsent = any(
+            not is_message_delivered(db_path, uid, m["id"], m.get("from_chat_id"), m.get("message_id"))
+            for m in pkg_msgs
+        )
+        if has_unsent:
+            missing.append(st)
+    return missing
 
 def split_stage_4_messages_to_solo(db_path: str) -> int:
     conn = get_connection(db_path)
     try:
         with conn:
             cur = conn.execute("UPDATE stage_messages SET package_id = id WHERE stage = 4")
-            return cur.rowcount
+            count = cur.rowcount
+            conn.execute(
+                "UPDATE delivered_drip_messages SET package_id = message_record_id "
+                "WHERE message_record_id IN (SELECT id FROM stage_messages WHERE stage = 4)"
+            )
+            return count
     finally:
         conn.close()
-
-
