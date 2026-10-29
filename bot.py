@@ -456,23 +456,85 @@ def get_plan_duration_keyboard(target_user_id: int):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- Complete Student Deletion Logic ---
+# --- Complete Student Deletion & Chat Wiping/Editing Logic ---
+
+REMOVAL_NOTICE_TEXT = "⛔️ تمام محتوا حذف شد و شما دیگر دانش‌آموز دکتر هاشمی نیستید."
+
+async def _clean_or_edit_single_message(bot, chat_id: int, mid: int) -> bool:
+    """
+    Attempts to delete message `mid` in `chat_id`.
+    If Telegram does not allow deletion (e.g. message older than 48 hours), edits the message text/caption/markup in-place
+    to replace its content with REMOVAL_NOTICE_TEXT.
+    Returns True if the message belonged to this chat and was deleted or edited.
+    """
+    if not mid or mid <= 0:
+        return False
+    try:
+        res = await bot.delete_message(chat_id=chat_id, message_id=mid)
+        if res:
+            return True
+    except Exception as del_err:
+        err_str = str(del_err).lower()
+        if "message to delete not found" in err_str or "message_id_invalid" in err_str or "chat not found" in err_str:
+            return False
+
+        # Message exists in this chat but cannot be deleted (e.g. >48h old) -> Edit it in-place
+        edited = False
+        if hasattr(bot, "edit_message_text"):
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=REMOVAL_NOTICE_TEXT,
+                    reply_markup=None
+                )
+                edited = True
+            except Exception as edit_err:
+                if "message is not modified" in str(edit_err).lower():
+                    edited = True
+
+        if not edited and hasattr(bot, "edit_message_caption"):
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    caption=REMOVAL_NOTICE_TEXT,
+                    reply_markup=None
+                )
+                edited = True
+            except Exception:
+                pass
+
+        if not edited and hasattr(bot, "edit_message_reply_markup"):
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    reply_markup=None
+                )
+                edited = True
+            except Exception:
+                pass
+
+        return edited
+    return False
 
 async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Completely removes a student:
-    1. Deletes all voices, files, and bot messages sent to the student in Telegram.
-    2. Unpins all pinned messages in the student's chat.
-    3. Removes the student's capabilities, states, study plans, dossier, and DB records.
-    4. Sends the final removal notification with ReplyKeyboardRemove() so no capabilities remain and nothing else is ever sent.
+    1. Sends a probe message with ReplyKeyboardRemove() to strip capabilities and obtain the latest message_id in the chat.
+    2. Deletes or edits all previous voices, files, and messages in the student's chat (both tracked DB IDs and backward scan for older messages).
+    3. Unpins all pinned messages in the student's chat.
+    4. Removes all student records, study plans, dossier, and scheduled tasks from the database.
+    5. Edits/sends the final notice: «تمام محتوا حذف شد و شما دیگر دانش‌آموز دکتر هاشمی نیستید.»
     """
     async with get_user_lock(target_user_id):
         st = database.get_student(config.DB_PATH, target_user_id)
         raw_name = (st.get("assigned_name") or st.get("full_name") or f"کاربر {target_user_id}") if st else f"کاربر {target_user_id}"
         safe_name = escape_md(raw_name)
 
-        # 1. Gather all message IDs ever sent to this student
-        sent_msg_ids = database.get_student_sent_messages(config.DB_PATH, target_user_id)
+        # 1. Gather all tracked message IDs for this student
+        tracked_ids = set(database.get_student_sent_messages(config.DB_PATH, target_user_id))
 
         # 2. Unpin any pinned messages in student's chat
         try:
@@ -480,41 +542,118 @@ async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Opt
         except Exception:
             pass
 
-        # 3. Delete all sent voices and messages from student's chat
-        deleted_count = 0
-        for mid in sent_msg_ids:
-            try:
-                await bot.delete_message(chat_id=target_user_id, message_id=mid)
-                deleted_count += 1
-            except Exception as e:
-                logger.debug(f"Could not delete message {mid} for student {target_user_id}: {e}")
+        # 3. Send initial probe message with ReplyKeyboardRemove() to immediately strip bottom keyboard and get current message_id
+        kb_remove = ReplyKeyboardRemove() if ReplyKeyboardRemove else None
+        probe_mid = None
+        notified_student = False
+        try:
+            probe_msg = await bot.send_message(
+                chat_id=target_user_id,
+                text="⏳ در حال حذف تمامی محتوا و ویس‌های قبلی...",
+                reply_markup=kb_remove
+            )
+            probe_mid = getattr(probe_msg, "message_id", None)
+            notified_student = True
+        except Exception as e:
+            logger.warning(f"Could not send initial probe to student {target_user_id}: {e}")
 
-        # 4. Clear in-memory state and wipe database records for this student
+        # 4. Build candidate message IDs to wipe/edit:
+        #    - All tracked message IDs in DB
+        #    - Backward scan from probe_mid - 1 (catches messages sent before DB tracking was active)
+        candidate_ids = set(tracked_ids)
+        if probe_mid and probe_mid > 1:
+            scan_start = probe_mid - 1
+            scan_end = max(1, probe_mid - 160)
+            for m in range(scan_start, scan_end - 1, -1):
+                candidate_ids.add(m)
+        for anchor in list(tracked_ids):
+            for m in range(max(1, anchor - 15), anchor + 15):
+                if not probe_mid or m < probe_mid:
+                    candidate_ids.add(m)
+
+        sorted_candidates = sorted(candidate_ids, reverse=True)
+        sem = asyncio.Semaphore(25)
+        cleaned_count = 0
+        lowest_hit_mid = None
+
+        async def _worker(mid: int) -> Tuple[int, bool]:
+            async with sem:
+                ok = await _clean_or_edit_single_message(bot, target_user_id, mid)
+                return mid, ok
+
+        # Execute in batches of 50 for fast parallel wiping/editing
+        for i in range(0, len(sorted_candidates), 50):
+            batch = sorted_candidates[i : i + 50]
+            results = await asyncio.gather(*(_worker(m) for m in batch))
+            for m, ok in results:
+                if ok:
+                    cleaned_count += 1
+                    if lowest_hit_mid is None or m < lowest_hit_mid:
+                        lowest_hit_mid = m
+
+        # Adaptive extension: if we found messages near the bottom of the backward scan window, scan further back
+        if lowest_hit_mid and probe_mid and lowest_hit_mid <= max(2, probe_mid - 140):
+            extra_ids = [
+                m for m in range(lowest_hit_mid - 1, max(0, lowest_hit_mid - 120), -1)
+                if m not in candidate_ids
+            ]
+            for i in range(0, len(extra_ids), 50):
+                batch = extra_ids[i : i + 50]
+                results = await asyncio.gather(*(_worker(m) for m in batch))
+                for _, ok in results:
+                    if ok:
+                        cleaned_count += 1
+
+        # 5. Clear in-memory state and wipe database records for this student
         active_states.pop(target_user_id, None)
         database.delete_student_completely(config.DB_PATH, target_user_id)
 
-        # 5. Send final removal notification and strip reply keyboard
-        removal_notice = "شما دیگر از لیست دانش‌آموزهای هاشمی حذف شدید."
-        kb_remove = ReplyKeyboardRemove() if ReplyKeyboardRemove else None
-        notified_student = False
-        try:
-            await bot.send_message(
-                chat_id=target_user_id,
-                text=removal_notice,
-                reply_markup=kb_remove
-            )
-            notified_student = True
-        except Exception as e:
-            logger.warning(f"Could not send removal notice to student {target_user_id}: {e}")
+        # 6. Remove temporary probe message and send the final removal notice with ReplyKeyboardRemove()
+        if probe_mid:
+            deleted_probe = False
+            try:
+                await bot.delete_message(chat_id=target_user_id, message_id=probe_mid)
+                deleted_probe = True
+            except Exception:
+                if hasattr(bot, "edit_message_text"):
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=target_user_id,
+                            message_id=probe_mid,
+                            text=REMOVAL_NOTICE_TEXT
+                        )
+                    except Exception:
+                        pass
 
-        # 6. Notify admin if requested
+            if deleted_probe:
+                try:
+                    await bot.send_message(
+                        chat_id=target_user_id,
+                        text=REMOVAL_NOTICE_TEXT,
+                        reply_markup=kb_remove
+                    )
+                    notified_student = True
+                except Exception:
+                    pass
+        else:
+            try:
+                await bot.send_message(
+                    chat_id=target_user_id,
+                    text=REMOVAL_NOTICE_TEXT,
+                    reply_markup=kb_remove
+                )
+                notified_student = True
+            except Exception:
+                pass
+
+        # 7. Notify admin if requested
         if notify_chat_id:
             admin_report = (
                 f"🗑 **دانش‌آموز «{safe_name}» به طور کامل حذف شد.** ✅\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"• 🎙 تمام ویس‌ها و پیام‌های قبلی ({deleted_count} پیام) از چت او حذف شدند.\n"
+                f"• 🎙 تمام ویس‌ها و چت‌های قبلی ({cleaned_count} پیام) حذف یا ادیت شدند.\n"
                 "• 🔒 تمام قابلیت‌ها، دکمه‌ها و ارسال‌های خودکار برای او غیرفعال و پاک شدند.\n"
-                "• 📩 پیام *«شما دیگر از لیست دانش‌آموزهای هاشمی حذف شدید.»* برای او ارسال گردید و دیگر هیچ پیامی برایش فرستاده نخواهد شد."
+                f"• 📩 پیام **«{REMOVAL_NOTICE_TEXT}»** در چت او ثبت گردید و دیگر هیچ پیامی برایش فرستاده نخواهد شد."
             )
             await bot.send_message(
                 chat_id=notify_chat_id,
@@ -526,7 +665,7 @@ async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Opt
         return {
             "user_id": target_user_id,
             "name": raw_name,
-            "deleted_messages_count": deleted_count,
+            "deleted_messages_count": cleaned_count,
             "notified_student": notified_student,
         }
 
@@ -2174,12 +2313,21 @@ async def student_callback_handler(update, context):
     query = update.callback_query
     user_id = query.from_user.id
 
+    if query.message and getattr(query.message, "message_id", None):
+        database.record_student_sent_message(config.DB_PATH, user_id, query.message.message_id, content_type="callback_msg")
+
     if database.is_student_removed(config.DB_PATH, user_id):
-        await query.answer("شما دیگر از لیست دانش‌آموزهای هاشمی حذف شدید.", show_alert=True)
+        await query.answer(REMOVAL_NOTICE_TEXT, show_alert=True)
         try:
             await query.message.delete()
         except Exception:
-            pass
+            try:
+                await query.edit_message_text(REMOVAL_NOTICE_TEXT, reply_markup=None)
+            except Exception:
+                try:
+                    await query.edit_message_caption(REMOVAL_NOTICE_TEXT, reply_markup=None)
+                except Exception:
+                    pass
         return
 
     student = database.get_student(config.DB_PATH, user_id)
@@ -2954,6 +3102,8 @@ async def message_collector(update, context):
 
     student = database.get_student(config.DB_PATH, user_id)
     if student:
+        if getattr(msg, "message_id", None):
+            database.record_student_sent_message(config.DB_PATH, user_id, msg.message_id, content_type="student_msg")
         curr_stage = student["current_stage"]
         raw_name = student.get("assigned_name") or student.get("full_name") or "دانش‌آموز"
         name = escape_md(raw_name)
