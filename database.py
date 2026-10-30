@@ -1,10 +1,13 @@
 import os
 import re
+import time
 import json
 import sqlite3
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 def adapt_datetime(val: datetime) -> str:
     return val.strftime("%Y-%m-%d %H:%M:%S")
@@ -13,6 +16,12 @@ sqlite3.register_adapter(datetime, adapt_datetime)
 
 def get_now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def get_iran_now() -> datetime:
+    return datetime.now(IRAN_TZ)
+
+def utc_to_iran_date(utc_dt: datetime):
+    return (utc_dt.replace(tzinfo=timezone.utc).astimezone(IRAN_TZ)).date()
 
 def parse_db_datetime(val: Any) -> Optional[datetime]:
     if not val:
@@ -92,8 +101,12 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1;").fetchall()
     except sqlite3.OperationalError:
-        pass
+        try:
+            conn.execute("PRAGMA journal_mode = DELETE;")
+        except sqlite3.OperationalError:
+            pass
     return conn
 
 def init_db(db_path: str) -> None:
@@ -114,7 +127,7 @@ def init_db(db_path: str) -> None:
                 "username TEXT NULL,"
                 "full_name TEXT NOT NULL,"
                 "assigned_name TEXT NULL,"
-                "current_stage INTEGER DEFAULT 1,"
+                "current_stage INTEGER DEFAULT 0,"
                 "registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
                 "last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
                 "stage_updated_at TIMESTAMP NULL,"
@@ -132,6 +145,9 @@ def init_db(db_path: str) -> None:
                 "caption TEXT NULL,"
                 "package_id INTEGER NULL,"
                 "file_unique_id TEXT NULL,"
+                "file_id TEXT NULL,"
+                "media_type TEXT NULL,"
+                "text_content TEXT NULL,"
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE TABLE IF NOT EXISTS settings ("
@@ -145,6 +161,10 @@ def init_db(db_path: str) -> None:
                 "broadcast_json TEXT NULL,"
                 "dossier_json TEXT NULL,"
                 "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ");"
+                "CREATE TABLE IF NOT EXISTS processed_updates ("
+                "dedup_key TEXT PRIMARY KEY,"
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE TABLE IF NOT EXISTS delivered_drip_messages ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -175,6 +195,8 @@ def init_db(db_path: str) -> None:
                 "message_id INTEGER NULL,"
                 "caption TEXT NULL,"
                 "text_content TEXT NULL,"
+                "file_id TEXT NULL,"
+                "media_type TEXT NULL,"
                 "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE TABLE IF NOT EXISTS delivered_messages ("
@@ -216,6 +238,7 @@ def init_db(db_path: str) -> None:
                 "media_type TEXT NULL,"
                 "caption TEXT NULL,"
                 "text_content TEXT NULL,"
+                "file_id TEXT NULL,"
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE INDEX IF NOT EXISTS idx_dossier_user ON student_dossier(user_id);"
@@ -239,6 +262,12 @@ def init_db(db_path: str) -> None:
             for col_def, tbl in [
                 ("package_id INTEGER NULL", "stage_messages"),
                 ("file_unique_id TEXT NULL", "stage_messages"),
+                ("file_id TEXT NULL", "stage_messages"),
+                ("media_type TEXT NULL", "stage_messages"),
+                ("text_content TEXT NULL", "stage_messages"),
+                ("file_id TEXT NULL", "intro_contents"),
+                ("media_type TEXT NULL", "intro_contents"),
+                ("file_id TEXT NULL", "student_dossier"),
                 ("package_id INTEGER NULL", "delivered_drip_messages"),
                 ("from_chat_id INTEGER NULL", "delivered_drip_messages"),
                 ("source_message_id INTEGER NULL", "delivered_drip_messages"),
@@ -289,16 +318,47 @@ def init_db(db_path: str) -> None:
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", ("drip_send_hour", "23"))
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", ("morning_quote_index", "0"))
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", ("last_morning_quote_date", ""))
+            conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", ("last_nightly_cycle_date", ""))
     finally:
         conn.close()
 
-    # Automatically clean up any duplicate stage messages on startup
     try:
         deduplicate_stage_messages(db_path)
     except Exception:
         pass
 
-# --- Persistent User State Helpers (Prevents Lost State Across Restarts/Workers) ---
+# --- Atomic Update Deduplication (Prevents Double Processing Across Reconnects/Instances) ---
+
+def claim_update_key(db_path: str, dedup_key: str) -> bool:
+    """
+    Atomically claims an update/message key so the exact same Telegram update or button press
+    can never be processed twice. Also prunes old keys (> 2 days) periodically.
+    """
+    if not dedup_key:
+        return True
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_updates (dedup_key, created_at) VALUES (?, ?)",
+            (dedup_key, get_now_utc())
+        )
+        claimed = cur.rowcount > 0
+        if claimed and hash(dedup_key) % 50 == 0:
+            cutoff = get_now_utc() - timedelta(days=2)
+            conn.execute("DELETE FROM processed_updates WHERE created_at < ?", (cutoff,))
+        conn.commit()
+        return claimed
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return True
+    finally:
+        conn.close()
+
+# --- Persistent User State Helpers ---
 
 def get_user_state(db_path: str, user_id: int) -> Optional[str]:
     conn = get_connection(db_path)
@@ -347,6 +407,20 @@ def set_user_package_id(db_path: str, user_id: int, package_id: Optional[int]) -
             )
     except Exception:
         pass
+    finally:
+        conn.close()
+
+def get_next_package_id(db_path: str) -> int:
+    """Generates a strictly increasing unique package_id that never collides even within the same millisecond."""
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT COALESCE(MAX(package_id), 0) as max_pkg, COALESCE(MAX(id), 0) as max_id FROM stage_messages")
+        row = cur.fetchone()
+        db_max = max(int(row["max_pkg"] or 0), int(row["max_id"] or 0)) if row else 0
+        ts_ms = int(time.time() * 1000)
+        return max(db_max + 1, ts_ms)
+    except Exception:
+        return int(time.time() * 1000)
     finally:
         conn.close()
 
@@ -467,6 +541,34 @@ def claim_morning_quote_date(db_path: str, today_str: str, total_quotes: int) ->
     finally:
         conn.close()
 
+def claim_nightly_cycle_date(db_path: str, today_str: str) -> bool:
+    """Atomically claims today's nightly cycle (drip + milestones + auto-backup) so it never fires more than once per day."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute("SELECT value FROM settings WHERE key = 'last_nightly_cycle_date'")
+        row = cur.fetchone()
+        last_date = row["value"] if row else ""
+        if last_date == today_str:
+            conn.rollback()
+            return False
+
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('last_nightly_cycle_date', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (today_str,)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        conn.close()
+
 def create_invite(db_path: str, code: str, assigned_name: Optional[str] = None) -> str:
     conn = get_connection(db_path)
     try:
@@ -491,10 +593,18 @@ def get_invite(db_path: str, code: str) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Optional[str], full_name: str) -> Tuple[bool, Optional[str]]:
+def validate_and_use_invite(
+    db_path: str,
+    code: str,
+    user_id: int,
+    username: Optional[str],
+    full_name: str,
+    initial_stage: int = 0
+) -> Tuple[bool, Optional[str]]:
     """
     Atomically validates and marks an invite code as used using BEGIN IMMEDIATE.
-    Prevents race conditions when a student taps Start multiple times concurrently.
+    Starts new/re-invited students at stage `initial_stage` (default 0 = Red Lines & Intro voice phase)
+    so Stage 1 is never skipped before they tap 'Enter Stage 1'.
     """
     conn = get_connection(db_path)
     try:
@@ -518,18 +628,19 @@ def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Opt
             conn.rollback()
             return False, None
 
-        # Remove from removed_students if re-invited with a fresh invite link
+        # Clear removed status and any old stage 0 delivery lock so intro media is always sent fresh
         conn.execute("DELETE FROM removed_students WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM delivered_messages WHERE user_id = ? AND stage = 0", (user_id,))
 
         conn.execute(
             "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, day_8_sent, day_30_sent, admin_notified) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0, 0) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "username = excluded.username, "
             "full_name = excluded.full_name, "
             "assigned_name = COALESCE(excluded.assigned_name, students.assigned_name), "
             "last_active = excluded.last_active",
-            (user_id, username, full_name, assigned_name, now, now, now)
+            (user_id, username, full_name, assigned_name, int(initial_stage), now, now, now)
         )
         conn.commit()
         return True, assigned_name
@@ -641,7 +752,7 @@ def delete_student_completely(db_path: str, user_id: int) -> Optional[Dict[str, 
     finally:
         conn.close()
 
-def update_student_stage(db_path: str, user_id: int, new_stage: int) -> None:
+def update_student_stage(db_path: str, user_id: int, new_stage: int, reset_delivered_from_stage: bool = False) -> None:
     conn = get_connection(db_path)
     try:
         with conn:
@@ -650,6 +761,11 @@ def update_student_stage(db_path: str, user_id: int, new_stage: int) -> None:
                 "UPDATE students SET current_stage = ?, last_active = ?, stage_updated_at = ?, stage_warning_sent = 0 WHERE user_id = ?",
                 (new_stage, now, now, user_id)
             )
+            if reset_delivered_from_stage:
+                conn.execute(
+                    "DELETE FROM delivered_messages WHERE user_id = ? AND stage >= ?",
+                    (user_id, new_stage)
+                )
     finally:
         conn.close()
 
@@ -659,7 +775,7 @@ def get_students_due_for_inactivity_warning(db_path: str) -> List[Dict[str, Any]
         cur = conn.execute(
             "SELECT user_id, username, full_name, assigned_name, current_stage, registered_at, stage_updated_at, stage_warning_sent "
             "FROM students "
-            "WHERE current_stage BETWEEN 1 AND 3 AND (stage_warning_sent IS NULL OR stage_warning_sent = 0)"
+            "WHERE current_stage BETWEEN 0 AND 3 AND (stage_warning_sent IS NULL OR stage_warning_sent = 0)"
         )
         candidates = [dict(row) for row in cur.fetchall()]
         due = []
@@ -672,9 +788,9 @@ def get_students_due_for_inactivity_warning(db_path: str) -> List[Dict[str, Any]
             if not st_dt:
                 continue
             diff_hours = (now - st_dt).total_seconds() / 3600.0
-            stage = st.get("current_stage", 1)
-            # Stage 1: 18 hours; Stage 2 & 3: 24 hours
-            threshold_hours = 18.0 if stage == 1 else 24.0
+            stage = st.get("current_stage", 0)
+            # Stage 0 & 1: 18 hours; Stage 2 & 3: 24 hours
+            threshold_hours = 18.0 if stage <= 1 else 24.0
             if diff_hours >= threshold_hours:
                 st["hours_waiting"] = diff_hours
                 due.append(st)
@@ -703,6 +819,7 @@ def mark_milestone_sent(db_path: str, user_id: int, milestone_days: int) -> None
         conn.close()
 
 def get_students_due_for_milestones(db_path: str) -> List[Tuple[Dict[str, Any], int]]:
+    """Checks both exact elapsed seconds (with 1h grace) and Iran calendar day difference so nightly 22:00 runs never miss Day 8 or Day 30."""
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
@@ -711,6 +828,7 @@ def get_students_due_for_milestones(db_path: str) -> List[Tuple[Dict[str, Any], 
         students = [dict(row) for row in cur.fetchall()]
         due = []
         now = get_now_utc()
+        today_iran = utc_to_iran_date(now)
 
         for st in students:
             reg_str = st.get("registered_at")
@@ -719,12 +837,13 @@ def get_students_due_for_milestones(db_path: str) -> List[Tuple[Dict[str, Any], 
             reg_dt = parse_db_datetime(reg_str)
             if not reg_dt:
                 continue
-            diff_days = (now - reg_dt).total_seconds() / 86400.0
+            diff_days_exact = (now - reg_dt).total_seconds() / 86400.0
+            diff_cal_days = (today_iran - utc_to_iran_date(reg_dt)).days
 
-            if diff_days >= 8.0 and not st.get("day_8_sent"):
+            if (diff_days_exact >= 7.95 or diff_cal_days >= 8) and not st.get("day_8_sent"):
                 due.append((st, 8))
 
-            if diff_days >= 30.0 and not st.get("day_30_sent"):
+            if (diff_days_exact >= 29.95 or diff_cal_days >= 30) and not st.get("day_30_sent"):
                 due.append((st, 30))
         return due
     finally:
@@ -737,7 +856,10 @@ def add_stage_message(
     message_id: int,
     caption: Optional[str] = None,
     package_id: Optional[int] = None,
-    file_unique_id: Optional[str] = None
+    file_unique_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    media_type: Optional[str] = None,
+    text_content: Optional[str] = None
 ) -> int:
     conn = get_connection(db_path)
     try:
@@ -769,8 +891,9 @@ def add_stage_message(
                     return existing_cap["id"]
 
             cur = conn.execute(
-                "INSERT INTO stage_messages (stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (stage, from_chat_id, message_id, caption, package_id, file_unique_id, get_now_utc())
+                "INSERT INTO stage_messages (stage, from_chat_id, message_id, caption, package_id, file_unique_id, file_id, media_type, text_content, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stage, from_chat_id, message_id, caption, package_id, file_unique_id, file_id, media_type, text_content, get_now_utc())
             )
             inserted_id = cur.lastrowid
             if package_id is None:
@@ -833,7 +956,7 @@ def delete_stage_message_by_id(db_path: str, record_id: int) -> Optional[Dict[st
     try:
         with conn:
             cur = conn.execute(
-                "SELECT id, stage, from_chat_id, message_id, caption, package_id FROM stage_messages WHERE id = ?",
+                "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_id, media_type, text_content FROM stage_messages WHERE id = ?",
                 (record_id,)
             )
             row = cur.fetchone()
@@ -849,7 +972,8 @@ def get_stage_messages(db_path: str, stage: int) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at FROM stage_messages WHERE stage = ? ORDER BY id ASC",
+            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, file_id, media_type, text_content, created_at "
+            "FROM stage_messages WHERE stage = ? ORDER BY id ASC",
             (stage,)
         )
         return [dict(row) for row in cur.fetchall()]
@@ -881,7 +1005,7 @@ def get_stage_packages(db_path: str, stage: int = 4) -> List[List[Dict[str, Any]
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at "
+            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, file_id, media_type, text_content, created_at "
             "FROM stage_messages WHERE stage = ? ORDER BY id ASC",
             (stage,)
         )
@@ -1061,6 +1185,11 @@ def record_drip_delivery(db_path: str, user_id: int, message_record_id: int) -> 
     record_drip_package_delivery(db_path, user_id, message_record_id, [message_record_id])
 
 def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = False) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """
+    Finds Stage 4 students eligible for their next drip package.
+    Uses both Iran calendar date difference and a 1-hour grace window on exact seconds
+    so a few seconds of delivery delay on Day N never causes Day N+interval to be skipped at 22:00.
+    """
     conn = get_connection(db_path)
     try:
         interval_days = int(get_setting(db_path, "drip_interval_days", "2"))
@@ -1075,6 +1204,7 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
 
     eligible = []
     now = get_now_utc()
+    today_iran = utc_to_iran_date(now)
 
     for st in candidates:
         next_pkg = get_next_unsent_drip_package(db_path, st["user_id"])
@@ -1093,8 +1223,9 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
             if not last_sent:
                 eligible.append((st, next_pkg))
             else:
-                diff_days = (now - last_sent).total_seconds() / 86400.0
-                if diff_days >= interval_days:
+                diff_days_exact = (now - last_sent).total_seconds() / 86400.0
+                diff_cal_days = (today_iran - utc_to_iran_date(last_sent)).days
+                if diff_days_exact >= (interval_days - 0.04) or diff_cal_days >= interval_days:
                     eligible.append((st, next_pkg))
     return eligible
 
@@ -1105,12 +1236,10 @@ def create_study_plan(db_path: str, user_id: int, duration_days: int) -> int:
     conn = get_connection(db_path)
     try:
         with conn:
-            # Mark previous active plans as superseded
             conn.execute("UPDATE study_plans SET status = 'SUPERSEDED' WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT')", (user_id,))
 
             now = get_now_utc()
             end_date = now + timedelta(days=duration_days)
-            # Reminder is 1 day before expiration (or now if 1-day plan)
             reminder_date = end_date - timedelta(days=1)
             if reminder_date < now:
                 reminder_date = now
@@ -1169,7 +1298,7 @@ def submit_study_plan_report(db_path: str, user_id: int, report_text: str) -> Op
     try:
         with conn:
             cur = conn.execute(
-                "SELECT id, duration_days FROM study_plans WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT') ORDER BY id DESC LIMIT 1",
+                "SELECT id, duration_days, report_text FROM study_plans WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT', 'REPORT_SUBMITTED') ORDER BY id DESC LIMIT 1",
                 (user_id,)
             )
             plan = cur.fetchone()
@@ -1177,9 +1306,11 @@ def submit_study_plan_report(db_path: str, user_id: int, report_text: str) -> Op
                 return None
 
             plan_id = plan["id"]
+            prev_text = (plan["report_text"] or "").strip()
+            combined_text = f"{prev_text}\n{report_text}".strip() if prev_text else report_text
             conn.execute(
                 "UPDATE study_plans SET report_submitted = 1, report_text = ?, status = 'REPORT_SUBMITTED' WHERE id = ?",
-                (report_text, plan_id)
+                (combined_text, plan_id)
             )
             return {"plan_id": plan_id, "duration_days": plan["duration_days"]}
     finally:
@@ -1262,19 +1393,28 @@ def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
 
 # --- Intro / Rules (Red Lines) Content ---
 
-def set_intro_media(db_path: str, from_chat_id: int, message_id: int, caption: Optional[str] = None) -> None:
+def set_intro_media(
+    db_path: str,
+    from_chat_id: int,
+    message_id: int,
+    caption: Optional[str] = None,
+    file_id: Optional[str] = None,
+    media_type: Optional[str] = None
+) -> None:
     conn = get_connection(db_path)
     try:
         with conn:
             conn.execute(
-                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, updated_at) "
-                "VALUES (1, ?, ?, ?, ?) "
+                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, file_id, media_type, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 "from_chat_id = excluded.from_chat_id, "
                 "message_id = excluded.message_id, "
                 "caption = excluded.caption, "
+                "file_id = excluded.file_id, "
+                "media_type = excluded.media_type, "
                 "updated_at = excluded.updated_at",
-                (from_chat_id, message_id, caption, get_now_utc())
+                (from_chat_id, message_id, caption, file_id, media_type, get_now_utc())
             )
     finally:
         conn.close()
@@ -1299,7 +1439,7 @@ def clear_intro_media(db_path: str) -> None:
     try:
         with conn:
             conn.execute(
-                "UPDATE intro_contents SET from_chat_id = NULL, message_id = NULL, caption = NULL WHERE id = 1"
+                "UPDATE intro_contents SET from_chat_id = NULL, message_id = NULL, caption = NULL, file_id = NULL, media_type = NULL WHERE id = 1"
             )
     finally:
         conn.close()
@@ -1314,20 +1454,30 @@ def clear_intro_rules(db_path: str) -> None:
     finally:
         conn.close()
 
-def set_intro_content(db_path: str, from_chat_id: Optional[int] = None, message_id: Optional[int] = None, caption: Optional[str] = None, text_content: Optional[str] = None) -> None:
+def set_intro_content(
+    db_path: str,
+    from_chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    caption: Optional[str] = None,
+    text_content: Optional[str] = None,
+    file_id: Optional[str] = None,
+    media_type: Optional[str] = None
+) -> None:
     conn = get_connection(db_path)
     try:
         with conn:
             conn.execute(
-                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, text_content, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?) "
+                "INSERT INTO intro_contents (id, from_chat_id, message_id, caption, text_content, file_id, media_type, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 "from_chat_id = excluded.from_chat_id, "
                 "message_id = excluded.message_id, "
                 "caption = excluded.caption, "
                 "text_content = excluded.text_content, "
+                "file_id = COALESCE(excluded.file_id, intro_contents.file_id), "
+                "media_type = COALESCE(excluded.media_type, intro_contents.media_type), "
                 "updated_at = excluded.updated_at",
-                (from_chat_id, message_id, caption, text_content, get_now_utc())
+                (from_chat_id, message_id, caption, text_content, file_id, media_type, get_now_utc())
             )
     finally:
         conn.close()
@@ -1335,7 +1485,7 @@ def set_intro_content(db_path: str, from_chat_id: Optional[int] = None, message_
 def get_intro_content(db_path: str) -> Optional[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
-        cur = conn.execute("SELECT id, from_chat_id, message_id, caption, text_content, updated_at FROM intro_contents WHERE id = 1")
+        cur = conn.execute("SELECT id, from_chat_id, message_id, caption, text_content, file_id, media_type, updated_at FROM intro_contents WHERE id = 1")
         row = cur.fetchone()
         return dict(row) if row else None
     finally:
@@ -1358,15 +1508,16 @@ def add_student_dossier_note(
     message_id: Optional[int] = None,
     media_type: str = "text",
     caption: Optional[str] = None,
-    text_content: Optional[str] = None
+    text_content: Optional[str] = None,
+    file_id: Optional[str] = None
 ) -> int:
     conn = get_connection(db_path)
     try:
         with conn:
             cur = conn.execute(
-                "INSERT INTO student_dossier (user_id, from_chat_id, message_id, media_type, caption, text_content, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, from_chat_id, message_id, media_type, caption, text_content, get_now_utc())
+                "INSERT INTO student_dossier (user_id, from_chat_id, message_id, media_type, caption, text_content, file_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, from_chat_id, message_id, media_type, caption, text_content, file_id, get_now_utc())
             )
             return cur.lastrowid
     finally:
@@ -1376,7 +1527,7 @@ def get_student_dossier(db_path: str, user_id: int) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT id, user_id, from_chat_id, message_id, media_type, caption, text_content, created_at "
+            "SELECT id, user_id, from_chat_id, message_id, media_type, caption, text_content, file_id, created_at "
             "FROM student_dossier WHERE user_id = ? ORDER BY id ASC",
             (user_id,)
         )
@@ -1434,12 +1585,10 @@ def _compute_name_similarity(query_norm: str, target_norm: str) -> Tuple[float, 
     if query_norm == target_norm:
         return 1.0, "exact"
 
-    # Substring or prefix match
     if query_norm in target_norm or target_norm in query_norm:
         ratio = min(len(query_norm), len(target_norm)) / max(len(query_norm), len(target_norm), 1)
         return 0.85 + 0.14 * ratio, "substring"
 
-    # Token-level prefix/substring/fuzzy match
     q_tokens = query_norm.split()
     t_tokens = target_norm.split()
     best_tok_score = 0.0
@@ -1504,7 +1653,6 @@ def find_closest_students_by_name(db_path: str, query_name: str, limit: int = 5)
     if fuzzy:
         return fuzzy[:limit]
 
-    # Fallback: return top closest candidates so admin can still pick
     return scored[: min(3, len(scored))]
 
 def find_students_by_name(db_path: str, query_name: str) -> List[Dict[str, Any]]:

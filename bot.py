@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import html
 import logging
 import secrets
@@ -145,11 +146,18 @@ class PersistentDossierDict(dict):
 # "AWAITING_STUDENT_NAME", "AWAITING_DELETE_STUDENT_NAME", "RECORD_STAGE_...",
 # "AWAITING_CUSTOM_DAYS_<user_id>", "AWAITING_STUDY_REPORT",
 # "AWAITING_INTRO_MEDIA", "AWAITING_INTRO_RULES",
-# "AWAITING_BROADCAST_CONTENT", "AWAITING_MANUAL_DOSSIER_<user_id>"
+# "AWAITING_BROADCAST_CONTENT", "AWAITING_MANUAL_DOSSIER_<user_id>",
+# "AWAITING_DIRECT_MESSAGE_<user_id>"
 active_states: Dict[int, Optional[str]] = PersistentStateDict()
 active_package_ids: Dict[int, int] = PersistentPackageDict()
 pending_broadcast: Dict[int, Dict[str, Any]] = PersistentBroadcastDict()
 pending_dossier_notes: Dict[int, Dict[str, Any]] = PersistentDossierDict()
+
+# Mapping of admin notification message_id -> student user_id so Admin can Reply directly to a student
+admin_reply_targets: Dict[int, int] = {}
+
+# In-memory debounce cache to prevent rapid double-tap duplicate responses
+_RECENT_ACTION_TS: Dict[Tuple[int, str], float] = {}
 
 # Concurrency locks to guarantee zero duplicate deliveries and strict ordering
 user_delivery_locks: Dict[int, asyncio.Lock] = {}
@@ -157,11 +165,50 @@ drip_cycle_lock = asyncio.Lock()
 scheduler_cycle_lock = asyncio.Lock()
 _CACHED_BOT_USERNAME: Optional[str] = None
 _CONFLICT_COUNT: int = 0
+_LAST_CONFLICT_TS: float = 0.0
+_IS_CONFLICTED: bool = False
+
+# Exit code 42 signals run_workflow.sh that another newer bot instance took over polling (do not respawn!)
+CONFLICT_EXIT_CODE = 42
 
 def get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in user_delivery_locks:
         user_delivery_locks[user_id] = asyncio.Lock()
     return user_delivery_locks[user_id]
+
+def is_duplicate_request(update: Any, action_tag: str = "") -> bool:
+    """
+    Deduplicates both by Telegram's update_id/message_id in SQLite and by a 1.5-second debounce window
+    on identical menu button clicks so the bot never sends duplicate replies.
+    """
+    if not update:
+        return False
+    upd_id = getattr(update, "update_id", None)
+    if upd_id is not None:
+        if not database.claim_update_key(config.DB_PATH, f"upd:{upd_id}"):
+            return True
+
+    user = getattr(update, "effective_user", None)
+    uid = getattr(user, "id", 0) if user else 0
+    msg = getattr(update, "message", None)
+    cb = getattr(update, "callback_query", None)
+
+    if msg and getattr(msg, "message_id", None) and uid:
+        if not database.claim_update_key(config.DB_PATH, f"msg:{uid}:{msg.message_id}"):
+            return True
+
+    if uid and action_tag:
+        now_ts = time.monotonic()
+        key = (uid, action_tag)
+        prev_ts = _RECENT_ACTION_TS.get(key, 0.0)
+        if (now_ts - prev_ts) < 1.2:
+            return True
+        _RECENT_ACTION_TS[key] = now_ts
+        if len(_RECENT_ACTION_TS) > 500:
+            cutoff = now_ts - 30.0
+            for k in [k for k, v in _RECENT_ACTION_TS.items() if v < cutoff]:
+                _RECENT_ACTION_TS.pop(k, None)
+    return False
 
 try:
     from telegram import (
@@ -229,20 +276,31 @@ def escape_md(text: Optional[str]) -> str:
         text_str = text_str.replace(ch, f"\\{ch}")
     return text_str
 
-def extract_media_unique_id(msg) -> Optional[str]:
-    """Extracts Telegram's permanent file_unique_id from any media message to prevent duplicate saves."""
+def extract_media_info(msg) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Extracts (file_unique_id, file_id, media_type) from a Telegram Message object.
+    Storing `file_id` ensures media can still be delivered even if the original message in admin's chat is deleted.
+    """
     if not msg:
-        return None
+        return None, None, "text"
     for attr in ("voice", "audio", "video", "video_note", "document", "animation"):
         media_obj = getattr(msg, attr, None)
-        if media_obj and getattr(media_obj, "file_unique_id", None):
-            return str(media_obj.file_unique_id)
+        if media_obj:
+            f_uid = getattr(media_obj, "file_unique_id", None)
+            f_id = getattr(media_obj, "file_id", None)
+            if f_uid or f_id:
+                return (str(f_uid) if f_uid else None, str(f_id) if f_id else None, attr)
     photos = getattr(msg, "photo", None)
     if photos and len(photos) > 0:
         best_photo = photos[-1]
-        if getattr(best_photo, "file_unique_id", None):
-            return str(best_photo.file_unique_id)
-    return None
+        f_uid = getattr(best_photo, "file_unique_id", None)
+        f_id = getattr(best_photo, "file_id", None)
+        return (str(f_uid) if f_uid else None, str(f_id) if f_id else None, "photo")
+    return None, None, "text"
+
+def extract_media_unique_id(msg) -> Optional[str]:
+    f_uid, _, _ = extract_media_info(msg)
+    return f_uid
 
 async def safe_reply_text(message_obj, text: str, **kwargs):
     """Replies with text; if Markdown parsing fails due to unescaped user characters, automatically falls back to plain text."""
@@ -266,13 +324,45 @@ async def safe_bot_send_message(bot, chat_id: int, text: str, **kwargs):
             return await bot.send_message(chat_id=chat_id, text=text, **fallback_kwargs)
         raise
 
+async def safe_edit_or_reply(query, text: str, **kwargs):
+    """Attempts to edit the inline menu message in-place; if editing fails, falls back to sending a new reply."""
+    if query and getattr(query, "message", None):
+        try:
+            return await query.edit_message_text(text, **kwargs)
+        except Exception as e:
+            err_l = str(e).lower()
+            if "message is not modified" in err_l:
+                return query.message
+            if kwargs.get("parse_mode") and ("can't parse entities" in err_l or "bad request" in err_l):
+                try:
+                    fb_kwargs = dict(kwargs)
+                    fb_kwargs.pop("parse_mode", None)
+                    return await query.edit_message_text(text, **fb_kwargs)
+                except Exception:
+                    pass
+            return await safe_reply_text(query.message, text, **kwargs)
+    return None
+
 def is_admin(user_id: int, username: Optional[str]) -> bool:
     if config.ADMIN_ID and user_id == config.ADMIN_ID:
         return True
     if username and config.ADMIN_USERNAME:
         if username.lower().lstrip("@") == config.ADMIN_USERNAME.lower().lstrip("@"):
+            try:
+                database.set_setting(config.DB_PATH, "verified_admin_id", str(user_id))
+            except Exception:
+                pass
             return True
     return False
+
+def get_active_admin_chat_id() -> Optional[int]:
+    try:
+        saved = database.get_setting(config.DB_PATH, "verified_admin_id", "")
+        if saved and saved.isdigit():
+            return int(saved)
+    except Exception:
+        pass
+    return config.ADMIN_ID
 
 def format_invite_link_message(student_name: str, invite_link: str) -> str:
     """Formats the student-facing invite message ready to be forwarded directly to the student."""
@@ -335,12 +425,10 @@ def parse_admin_delete_intent(text: str) -> Tuple[bool, Optional[str]]:
     if not norm:
         return False, None
 
-    # Ignore non-student deletion phrases (e.g. deleting files, voices, stages, backups)
     non_student_keywords = ("فایل", "ویس", "محتوا", "مرحله", "پیام", "بکاپ", "پرونده", "برنامه", "قوانین", "خط قرمز")
     if any(kw in norm for kw in non_student_keywords):
         return False, None
 
-    # Exact generic triggers without a specific name yet
     generic_phrases = {
         "حذف",
         "حذف دانش اموز",
@@ -358,7 +446,6 @@ def parse_admin_delete_intent(text: str) -> Tuple[bool, Optional[str]]:
     if norm in generic_phrases:
         return True, None
 
-    # Pattern 1: Starts with optional polite prefix + حذف + (optional: یه/یک دانش‌آموز/شاگرد/کاربر به اسم/نام) + <NAME>
     m1 = re.match(
         r"^(?:اقا\s+|لطفا\s+|بیزحمت\s+)?حذف(?:\s+کن)?(?:\s+(?:یه|یک))?(?:\s+(?:دانش\s*اموز|شاگرد|کاربر))?(?:\s+(?:به\s+)?(?:اسم|نام))?\s+(.+?)(?:\s+(?:رو|را)\s*(?:حذف\s*کن|پاک\s*کن)?)?$",
         norm
@@ -372,7 +459,6 @@ def parse_admin_delete_intent(text: str) -> Tuple[bool, Optional[str]]:
             return True, candidate
         return True, None
 
-    # Pattern 2: <NAME> رو/را حذف کن / از لیست حذف کن
     m2 = re.match(
         r"^(?:اقا\s+|لطفا\s+)?(?:دانش\s*اموز\s+|شاگرد\s+|کاربر\s+)?(.+?)\s+(?:رو|را)\s+(?:از\s+لیست\s+)?حذف\s*(?:کن|بکن|بشه|شید|کنید)$",
         norm
@@ -385,7 +471,7 @@ def parse_admin_delete_intent(text: str) -> Tuple[bool, Optional[str]]:
 
     return False, None
 
-# --- Tracked Student Message Delivery Helpers ---
+# --- Tracked Student Message Delivery & Resilient Media Fallback Helpers ---
 
 async def send_student_msg(bot, user_id: int, text: str, content_type: str = "text", track: bool = True, **kwargs):
     sent = await safe_bot_send_message(bot, chat_id=user_id, text=text, **kwargs)
@@ -399,13 +485,69 @@ async def reply_student_msg(message_obj, user_id: int, text: str, content_type: 
         database.record_student_sent_message(config.DB_PATH, user_id, sent.message_id, content_type=content_type)
     return sent
 
-async def copy_student_msg(bot, user_id: int, from_chat_id: int, message_id: int, content_type: str = "voice", track: bool = True, **kwargs):
-    copied = await bot.copy_message(chat_id=user_id, from_chat_id=from_chat_id, message_id=message_id, **kwargs)
-    if track and copied and getattr(copied, "message_id", None):
-        database.record_student_sent_message(config.DB_PATH, user_id, copied.message_id, content_type=content_type)
-    return copied
+async def copy_or_send_stored_message(
+    bot,
+    target_chat_id: int,
+    item: Dict[str, Any],
+    content_type: str = "voice",
+    track_for_student: bool = True,
+    **kwargs
+):
+    """
+    Delivers a stored message (from stage_messages, intro_contents, or student_dossier).
+    First tries `bot.copy_message(from_chat_id, message_id)`.
+    If the original message was deleted in the admin's chat, automatically falls back to sending via stored `file_id` or `text_content`!
+    """
+    sent = None
+    from_chat_id = item.get("from_chat_id")
+    message_id = item.get("message_id")
+    file_id = item.get("file_id")
+    media_type = (item.get("media_type") or "").lower()
+    caption = item.get("caption")
+    text_content = item.get("text_content")
 
-# --- Persistent Bottom Reply Keyboards (With Vivid Color Badges) ---
+    if from_chat_id and message_id:
+        try:
+            sent = await bot.copy_message(
+                chat_id=target_chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                **kwargs
+            )
+        except Exception as copy_err:
+            logger.warning(f"copy_message({from_chat_id}, {message_id}) failed ({copy_err}); attempting file_id/text fallback...")
+
+    if sent is None:
+        if file_id:
+            send_kwargs = dict(kwargs)
+            if caption and media_type != "video_note":
+                send_kwargs["caption"] = caption
+            if media_type == "voice" and hasattr(bot, "send_voice"):
+                sent = await bot.send_voice(chat_id=target_chat_id, voice=file_id, **send_kwargs)
+            elif media_type == "audio" and hasattr(bot, "send_audio"):
+                sent = await bot.send_audio(chat_id=target_chat_id, audio=file_id, **send_kwargs)
+            elif media_type == "video" and hasattr(bot, "send_video"):
+                sent = await bot.send_video(chat_id=target_chat_id, video=file_id, **send_kwargs)
+            elif media_type == "video_note" and hasattr(bot, "send_video_note"):
+                sent = await bot.send_video_note(chat_id=target_chat_id, video_note=file_id, **send_kwargs)
+            elif media_type == "photo" and hasattr(bot, "send_photo"):
+                sent = await bot.send_photo(chat_id=target_chat_id, photo=file_id, **send_kwargs)
+            elif hasattr(bot, "send_document"):
+                sent = await bot.send_document(chat_id=target_chat_id, document=file_id, **send_kwargs)
+        elif text_content or caption:
+            sent = await safe_bot_send_message(bot, chat_id=target_chat_id, text=(text_content or caption), **kwargs)
+        else:
+            raise RuntimeError(f"Stored message {item.get('id')} could not be copied and has no fallback file_id.")
+
+    if track_for_student and sent and getattr(sent, "message_id", None):
+        database.record_student_sent_message(config.DB_PATH, target_chat_id, sent.message_id, content_type=content_type)
+    return sent
+
+async def copy_student_msg(bot, user_id: int, from_chat_id: int, message_id: int, content_type: str = "voice", track: bool = True, **kwargs):
+    item = {"from_chat_id": from_chat_id, "message_id": message_id}
+    return await copy_or_send_stored_message(bot, user_id, item, content_type=content_type, track_for_student=track, **kwargs)
+
+# --- Persistent Bottom Reply Keyboards ---
 
 def get_admin_reply_keyboard():
     keyboard = [
@@ -426,8 +568,16 @@ def get_recording_reply_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_student_reply_keyboard(current_stage: int = 1):
-    if current_stage <= 3:
+def get_student_reply_keyboard(current_stage: int = 0):
+    """
+    Returns the student's bottom ReplyKeyboard.
+    - Stage 0 (Intro / Red Lines phase): top button is 'خط قرمزها را خواندم | ورود به مرحله ۱' so Stage 1 is NEVER skipped!
+    - Stage 1..3: top button advances to the next stage (2, 3, or Phase 4).
+    - Stage 4+: top button reminds student to keep chat pinned.
+    """
+    if current_stage <= 0:
+        top_btn = "🟢 ✅ خط قرمزها را خواندم | ورود به مرحله ۱ 🚀"
+    elif current_stage <= 3:
         next_st = current_stage + 1
         top_btn = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_st} ➡️" if next_st <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
     else:
@@ -440,7 +590,7 @@ def get_student_reply_keyboard(current_stage: int = 1):
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# --- Inline Keyboards (With Vivid Color Badges) ---
+# --- Inline Keyboards ---
 
 def get_admin_main_inline_keyboard():
     keyboard = [
@@ -463,7 +613,7 @@ def get_admin_main_inline_keyboard():
 def get_delete_students_keyboard(students: list):
     keyboard = []
     row = []
-    for st in students:
+    for st in students[:40]:
         uid = st["user_id"]
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         row.append(InlineKeyboardButton(f"🗑 حذف «{name}»", callback_data=f"admin_del_exec_{uid}", style="danger"))
@@ -522,7 +672,7 @@ def get_stage_action_keyboard(stage_num: int, has_content: bool = True):
         keyboard.append([InlineKeyboardButton("📦 ➕ افزودن پکیج چندرسانه‌ای (ویدیو/عکس + ویس)", callback_data="admin_record_4_package", style="primary")])
         keyboard.append([InlineKeyboardButton("🎯 🚀 انتخاب و ارسال دستی یک نوبت", callback_data="stage4_manual_menu", style="success")])
         if has_content:
-            keyboard.append([InlineKeyboardButton("🔄 تفکیک فایل‌های موجود به ویس‌های تکی", callback_data="stage4_split_solo", style="primary")])
+            keyboard.append([InlineKeyboardButton("🔄 تفکیک فایل‌های موجود به ویس‌های تکی", callback_data="stage4_split_solo_ask", style="primary")])
             keyboard.append([InlineKeyboardButton("👁 📥 مشاهده تمام فایل‌های بخش ۴", callback_data="stage_preview_4", style="success")])
             keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی کامل محتوای بخش ۴", callback_data="stage_clear_ask_4", style="danger")])
     else:
@@ -557,7 +707,7 @@ def get_intro_management_keyboard(has_media: bool = False, has_rules: bool = Fal
 def get_students_for_dossier_keyboard(students: list):
     keyboard = []
     row = []
-    for st in students:
+    for st in students[:40]:
         uid = st["user_id"]
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         cnt = database.get_student_dossier_count(config.DB_PATH, uid)
@@ -575,24 +725,35 @@ def get_dossier_actions_keyboard(target_user_id: int, has_notes: bool = True):
     keyboard = []
     if has_notes:
         keyboard.append([InlineKeyboardButton("👁 📥 مشاهده تمام پیام‌ها و ویس‌های پرونده", callback_data=f"dossier_view_{target_user_id}", style="success")])
-    keyboard.append([InlineKeyboardButton("➕ 📝 ثبت یادداشت متنی جدید", callback_data=f"dossier_addmanual_{target_user_id}", style="primary")])
+    keyboard.append([
+        InlineKeyboardButton("✉️ ارسال پیام/ویس به دانش‌آموز", callback_data=f"admin_reply_to_{target_user_id}", style="success"),
+        InlineKeyboardButton("➕ 📝 ثبت یادداشت در پرونده", callback_data=f"dossier_addmanual_{target_user_id}", style="primary"),
+    ])
+    keyboard.append([
+        InlineKeyboardButton("🔄 تغییر مرحله (۱ تا ۴)", callback_data=f"admin_setstage_menu_{target_user_id}", style="primary"),
+        InlineKeyboardButton("🗓 تنظیم برنامه درسی", callback_data=f"plan_user_{target_user_id}", style="primary"),
+    ])
     if has_notes:
         keyboard.append([InlineKeyboardButton("🗑 ⚠️ پاکسازی کامل پرونده این دانش‌آموز", callback_data=f"dossier_clear_{target_user_id}", style="danger")])
+    keyboard.append([InlineKeyboardButton("🔴 🗑 حذف کامل این دانش‌آموز و چت", callback_data=f"admin_del_exec_{target_user_id}", style="danger")])
     keyboard.append([InlineKeyboardButton("🔙 👥 بازگشت به لیست پرونده‌ها", callback_data="admin_dossier_menu", style="primary")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_dossier_assign_keyboard(students: list):
     keyboard = []
     row = []
-    for st in students:
+    for st in students[:30]:
         uid = st["user_id"]
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
-        row.append(InlineKeyboardButton(f"👤 {name}", callback_data=f"dossier_assign_{uid}", style="primary"))
+        row.append(InlineKeyboardButton(f"👤 ذخیره در پرونده «{name}»", callback_data=f"dossier_assign_{uid}", style="primary"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton("📥 افزودن به محتوای مراحل (۱ تا ۴)", callback_data="dossier_assign_to_stage_menu", style="success"),
+    ])
     keyboard.append([InlineKeyboardButton("❌ انصراف و عدم ذخیره", callback_data="dossier_assign_cancel", style="danger")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -639,7 +800,7 @@ def get_drip_settings_keyboard(interval_days: int, hour: int):
 def get_student_list_for_plans_keyboard(students: list):
     keyboard = []
     row = []
-    for st in students:
+    for st in students[:40]:
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         uid = st["user_id"]
         row.append(InlineKeyboardButton(f"👤 {name}", callback_data=f"plan_user_{uid}", style="primary"))
@@ -663,83 +824,143 @@ def get_plan_duration_keyboard(target_user_id: int):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- Complete Student Deletion & Chat Wiping/Editing Logic ---
+# --- Complete Student Deletion & High-Speed Batch Chat Wiping Logic ---
 
 REMOVAL_NOTICE_TEXT = "⛔️ تمام محتوا حذف شد و شما دیگر دانش‌آموز دکتر هاشمی نیستید."
 
-async def _clean_or_edit_single_message(bot, chat_id: int, mid: int) -> bool:
+async def _clean_or_edit_single_message(bot, chat_id: int, mid: int, allow_edit_fallback: bool = True) -> bool:
     """
-    Attempts to delete message `mid` in `chat_id`.
-    If Telegram does not allow deletion (e.g. message older than 48 hours), edits the message text/caption/markup in-place
-    to replace its content with REMOVAL_NOTICE_TEXT.
-    Returns True if the message belonged to this chat and was deleted or edited.
+    Attempts to delete message `mid` in `chat_id` with automatic FloodWait (RetryAfter) handling.
+    If Telegram does not allow deletion (e.g. message older than 48 hours) and `allow_edit_fallback` is True,
+    edits the message text/caption/markup in-place to replace its content with REMOVAL_NOTICE_TEXT.
     """
     if not mid or mid <= 0:
         return False
-    try:
-        res = await bot.delete_message(chat_id=chat_id, message_id=mid)
-        if res:
-            return True
-    except Exception as del_err:
-        err_str = str(del_err).lower()
-        if "message to delete not found" in err_str or "message_id_invalid" in err_str or "chat not found" in err_str:
-            return False
+    for attempt in range(2):
+        try:
+            res = await bot.delete_message(chat_id=chat_id, message_id=mid)
+            if res:
+                return True
+            break
+        except Exception as del_err:
+            err_str = str(del_err).lower()
+            retry_after = getattr(del_err, "retry_after", None)
+            if retry_after and attempt == 0:
+                await asyncio.sleep(min(float(retry_after) + 0.5, 5.0))
+                continue
+            if "message to delete not found" in err_str or "message_id_invalid" in err_str or "chat not found" in err_str:
+                return False
+            if not allow_edit_fallback:
+                return False
 
-        edited = False
-        if hasattr(bot, "edit_message_text"):
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=mid,
-                    text=REMOVAL_NOTICE_TEXT,
-                    reply_markup=None
-                )
-                edited = True
-            except Exception as edit_err:
-                if "message is not modified" in str(edit_err).lower():
+            edited = False
+            if hasattr(bot, "edit_message_text"):
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=mid,
+                        text=REMOVAL_NOTICE_TEXT,
+                        reply_markup=None
+                    )
                     edited = True
+                except Exception as edit_err:
+                    if "message is not modified" in str(edit_err).lower():
+                        edited = True
 
-        if not edited and hasattr(bot, "edit_message_caption"):
-            try:
-                await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=mid,
-                    caption=REMOVAL_NOTICE_TEXT,
-                    reply_markup=None
-                )
-                edited = True
-            except Exception:
-                pass
+            if not edited and hasattr(bot, "edit_message_caption"):
+                try:
+                    await bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=mid,
+                        caption=REMOVAL_NOTICE_TEXT,
+                        reply_markup=None
+                    )
+                    edited = True
+                except Exception:
+                    pass
 
-        if not edited and hasattr(bot, "edit_message_reply_markup"):
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=chat_id,
-                    message_id=mid,
-                    reply_markup=None
-                )
-                edited = True
-            except Exception:
-                pass
+            if not edited and hasattr(bot, "edit_message_reply_markup"):
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=mid,
+                        reply_markup=None
+                    )
+                    edited = True
+                except Exception:
+                    pass
 
-        return edited
+            return edited
     return False
+
+async def _batch_delete_messages(bot, chat_id: int, message_ids: List[int], is_tracked: bool = True) -> int:
+    """
+    Uses Telegram's batch `delete_messages` API (up to 100 IDs per request) when available
+    to wipe chat history instantaneously without triggering HTTP FloodWait limits, then falls back
+    to individual delete/edit for any older messages.
+    """
+    valid_ids = sorted({int(m) for m in message_ids if m and int(m) > 0}, reverse=True)
+    if not valid_ids:
+        return 0
+
+    cleaned = 0
+    has_batch_api = hasattr(bot, "delete_messages")
+
+    if has_batch_api:
+        for i in range(0, len(valid_ids), 100):
+            chunk = valid_ids[i : i + 100]
+            try:
+                ok = await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+                if ok:
+                    cleaned += len(chunk) if is_tracked else max(1, len(chunk) // 4)
+                    # For tracked IDs, also ensure any >48h messages that batch delete silently skipped are scrubbed
+                    if is_tracked:
+                        sem = asyncio.Semaphore(10)
+                        async def _verify_single(m_id: int):
+                            async with sem:
+                                return await _clean_or_edit_single_message(bot, chat_id, m_id, allow_edit_fallback=True)
+                        await asyncio.gather(*(_verify_single(m) for m in chunk))
+                    continue
+            except Exception as e:
+                logger.debug(f"Batch delete_messages fallback on chunk ({len(chunk)} items): {e}")
+
+            # Fallback to bounded individual deletion for this chunk
+            sem = asyncio.Semaphore(12)
+            async def _single_worker(m_id: int) -> bool:
+                async with sem:
+                    return await _clean_or_edit_single_message(bot, chat_id, m_id, allow_edit_fallback=is_tracked)
+
+            results = await asyncio.gather(*(_single_worker(m) for m in chunk))
+            cleaned += sum(1 for r in results if r)
+    else:
+        sem = asyncio.Semaphore(15)
+        async def _single_worker(m_id: int) -> bool:
+            async with sem:
+                return await _clean_or_edit_single_message(bot, chat_id, m_id, allow_edit_fallback=is_tracked)
+
+        for i in range(0, len(valid_ids), 45):
+            batch = valid_ids[i : i + 45]
+            results = await asyncio.gather(*(_single_worker(m) for m in batch))
+            cleaned += sum(1 for r in results if r)
+
+    return cleaned
 
 async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Completely removes a student:
-    1. Sends a probe message with ReplyKeyboardRemove() to strip capabilities and obtain the latest message_id in the chat.
-    2. Deletes or edits all previous voices, files, and messages in the student's chat (both tracked DB IDs and backward scan for older messages).
-    3. Unpins all pinned messages in the student's chat.
-    4. Removes all student records, study plans, dossier, and scheduled tasks from the database.
-    5. Edits/sends the final notice: «تمام محتوا حذف شد و شما دیگر دانش‌آموز دکتر هاشمی نیستید.»
+    Completely removes a student and wipes their entire chat history:
+    1. Unpins all pinned messages in the student's chat.
+    2. Sends a probe message with ReplyKeyboardRemove() to immediately strip the student's bottom keyboard and capture the latest message_id.
+    3. Prioritizes deleting/editing all exact tracked message IDs (`student_sent_messages`) first so FloodWait never blocks real voices.
+    4. Sweeps neighboring/recent message IDs via batch `delete_messages` to wipe untracked student/bot messages.
+    5. Removes all student records, study plans, dossier, and scheduled tasks from the database.
+    6. Deletes the probe message as well so the chat is completely wiped (falling back to REMOVAL_NOTICE_TEXT only if deletion is blocked).
     """
     async with get_user_lock(target_user_id):
         st = database.get_student(config.DB_PATH, target_user_id)
         raw_name = (st.get("assigned_name") or st.get("full_name") or f"کاربر {target_user_id}") if st else f"کاربر {target_user_id}"
         safe_name = escape_md(raw_name)
 
-        # 1. Gather all tracked message IDs for this student
+        # 1. Gather all tracked message IDs for this student (both bot-sent and student-sent)
         tracked_ids = set(database.get_student_sent_messages(config.DB_PATH, target_user_id))
 
         # 2. Unpin any pinned messages in student's chat
@@ -748,14 +969,14 @@ async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Opt
         except Exception:
             pass
 
-        # 3. Send initial probe message with ReplyKeyboardRemove() to immediately strip bottom keyboard and get current message_id
+        # 3. Send initial probe message with ReplyKeyboardRemove() to strip bottom keyboard and get latest message_id
         kb_remove = ReplyKeyboardRemove() if ReplyKeyboardRemove else None
         probe_mid = None
         notified_student = False
         try:
             probe_msg = await bot.send_message(
                 chat_id=target_user_id,
-                text="⏳ در حال حذف تمامی محتوا و ویس‌های قبلی...",
+                text=REMOVAL_NOTICE_TEXT,
                 reply_markup=kb_remove
             )
             probe_mid = getattr(probe_msg, "message_id", None)
@@ -763,61 +984,32 @@ async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Opt
         except Exception as e:
             logger.warning(f"Could not send initial probe to student {target_user_id}: {e}")
 
-        # 4. Build candidate message IDs to wipe/edit
-        candidate_ids = set(tracked_ids)
+        # 4A. FIRST: Delete/scrub all exact tracked message IDs (highest priority!)
+        cleaned_count = await _batch_delete_messages(bot, target_user_id, list(tracked_ids), is_tracked=True)
+
+        # 4B. SECOND: Sweep untracked neighbor & recent message IDs
+        neighbor_ids = set()
         if probe_mid and probe_mid > 1:
-            scan_start = probe_mid - 1
-            scan_end = max(1, probe_mid - 160)
-            for m in range(scan_start, scan_end - 1, -1):
-                candidate_ids.add(m)
+            for m in range(probe_mid - 1, max(0, probe_mid - 160), -1):
+                if m not in tracked_ids:
+                    neighbor_ids.add(m)
         for anchor in list(tracked_ids):
-            for m in range(max(1, anchor - 15), anchor + 15):
-                if not probe_mid or m < probe_mid:
-                    candidate_ids.add(m)
+            for m in range(max(1, anchor - 10), anchor + 10):
+                if m not in tracked_ids and (not probe_mid or m < probe_mid):
+                    neighbor_ids.add(m)
 
-        sorted_candidates = sorted(candidate_ids, reverse=True)
-        sem = asyncio.Semaphore(25)
-        cleaned_count = 0
-        lowest_hit_mid = None
-
-        async def _worker(mid: int) -> Tuple[int, bool]:
-            async with sem:
-                ok = await _clean_or_edit_single_message(bot, target_user_id, mid)
-                return mid, ok
-
-        # Execute in batches of 50 for fast parallel wiping/editing
-        for i in range(0, len(sorted_candidates), 50):
-            batch = sorted_candidates[i : i + 50]
-            results = await asyncio.gather(*(_worker(m) for m in batch))
-            for m, ok in results:
-                if ok:
-                    cleaned_count += 1
-                    if lowest_hit_mid is None or m < lowest_hit_mid:
-                        lowest_hit_mid = m
-
-        # Adaptive extension: if we found messages near the bottom of the backward scan window, scan further back
-        if lowest_hit_mid and probe_mid and lowest_hit_mid <= max(2, probe_mid - 140):
-            extra_ids = [
-                m for m in range(lowest_hit_mid - 1, max(0, lowest_hit_mid - 120), -1)
-                if m not in candidate_ids
-            ]
-            for i in range(0, len(extra_ids), 50):
-                batch = extra_ids[i : i + 50]
-                results = await asyncio.gather(*(_worker(m) for m in batch))
-                for _, ok in results:
-                    if ok:
-                        cleaned_count += 1
+        if neighbor_ids:
+            cleaned_count += await _batch_delete_messages(bot, target_user_id, list(neighbor_ids), is_tracked=False)
 
         # 5. Clear in-memory state and wipe database records for this student
         active_states.pop(target_user_id, None)
         database.delete_student_completely(config.DB_PATH, target_user_id)
 
-        # 6. Remove temporary probe message and send the final removal notice with ReplyKeyboardRemove()
+        # 6. Delete the probe message too so the student's chat is completely wiped clean!
         if probe_mid:
-            deleted_probe = False
             try:
                 await bot.delete_message(chat_id=target_user_id, message_id=probe_mid)
-                deleted_probe = True
+                cleaned_count += 1
             except Exception:
                 if hasattr(bot, "edit_message_text"):
                     try:
@@ -829,35 +1021,13 @@ async def perform_student_deletion(bot, target_user_id: int, notify_chat_id: Opt
                     except Exception:
                         pass
 
-            if deleted_probe:
-                try:
-                    await bot.send_message(
-                        chat_id=target_user_id,
-                        text=REMOVAL_NOTICE_TEXT,
-                        reply_markup=kb_remove
-                    )
-                    notified_student = True
-                except Exception:
-                    pass
-        else:
-            try:
-                await bot.send_message(
-                    chat_id=target_user_id,
-                    text=REMOVAL_NOTICE_TEXT,
-                    reply_markup=kb_remove
-                )
-                notified_student = True
-            except Exception:
-                pass
-
         # 7. Notify admin if requested
         if notify_chat_id:
             admin_report = (
-                f"🗑 **دانش‌آموز «{safe_name}» به طور کامل حذف شد.** ✅\n"
+                f"🗑 **دانش‌آموز «{safe_name}» به طور کامل حذف و تاریخچه چت او پاکسازی شد.** ✅\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                f"• 🎙 تمام ویس‌ها و چت‌های قبلی ({cleaned_count} پیام) حذف یا ادیت شدند.\n"
-                "• 🔒 تمام قابلیت‌ها، دکمه‌ها و ارسال‌های خودکار برای او غیرفعال و پاک شدند.\n"
-                f"• 📩 پیام **«{REMOVAL_NOTICE_TEXT}»** در چت او ثبت گردید و دیگر هیچ پیامی برایش فرستاده نخواهد شد."
+                f"• 🧹 تمامی ویس‌ها، پیام‌های ربات و پیام‌های دانش‌آموز ({cleaned_count} پیام) از صفحه چت پاک شدند.\n"
+                "• 🔒 کیبورد، دسترسی‌ها، پرونده و ارسال‌های خودکار برای او به طور کامل غیرفعال و حذف گردید."
             )
             await safe_bot_send_message(
                 bot,
@@ -916,7 +1086,102 @@ async def handle_admin_delete_student_query(msg, bot, admin_id: int, query_name:
         reply_markup=get_delete_students_keyboard(matches)
     )
 
-# --- Content Delivery Helpers (Strictly Ordered & Deduplicated) ---
+# --- Onboarding & Content Delivery Helpers (Strictly Ordered & Deduplicated) ---
+
+async def send_onboarding_intro_sequence(bot, message_obj, user_id: int, display_name: str, is_admin_preview: bool = False):
+    """
+    Delivers the 2-step onboarding sequence (Step 1: Red Lines text, Step 2: Intro Voice/Media + 'Enter Stage 1' button).
+    Used both for new students (keeping them at stage 0 until they tap 'Enter Stage 1') and for Admin preview.
+    """
+    safe_display_name = escape_md(display_name)
+    salutation = f"سلام {safe_display_name} عزیز 🌸"
+    kb_to_use = get_admin_reply_keyboard() if is_admin_preview else get_student_reply_keyboard(0)
+    track = not is_admin_preview
+
+    await reply_student_msg(
+        message_obj,
+        user_id=user_id,
+        text=(
+            f"✨ **{salutation}**\n\n"
+            "به ربات مشاوره تحصیلی دکتر هاشمی خوش آمدید 🌱🎓\n"
+            "مسیر آموزشی شما در ۳ مرحله اولیه و سپس فاز تکمیلی طراحی شده است."
+        ),
+        parse_mode="Markdown",
+        reply_markup=kb_to_use,
+        track=track
+    )
+
+    intro = database.get_intro_content(config.DB_PATH)
+    if intro and intro.get("text_content"):
+        rules_text = intro["text_content"]
+    else:
+        rules_text = (
+            "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
+            "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
+            "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
+        )
+
+    has_intro_media = bool(intro and (intro.get("message_id") or intro.get("file_id")))
+    start_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🟢 ✅ خط قرمزها را خواندم و ویس اولیه را گوش دادم | ورود به مرحله اول 🚀" if has_intro_media else "🟢 ✅ مطالعه کردم و متعهدم | ورود به مرحله اول 🚀",
+            callback_data="admin_menu" if is_admin_preview else "student_start_stage_1",
+            style="success"
+        )
+    ]])
+
+    if has_intro_media:
+        await reply_student_msg(
+            message_obj,
+            user_id=user_id,
+            text=f"{rules_text}\n\n━━━━━━━━━━━━━━━━━━━━\n🎙 **اکنون ویس اولیه دکتر هاشمی را با دقت گوش دهید:**",
+            parse_mode="Markdown",
+            track=track
+        )
+        try:
+            await copy_or_send_stored_message(
+                bot,
+                target_chat_id=user_id,
+                item=intro,
+                content_type="voice",
+                track_for_student=track
+            )
+            if track and intro.get("from_chat_id") and intro.get("message_id"):
+                database.record_message_delivery(
+                    config.DB_PATH,
+                    user_id,
+                    0,
+                    0,
+                    intro["from_chat_id"],
+                    intro["message_id"]
+                )
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Could not deliver intro media message: {e}")
+
+        await reply_student_msg(
+            message_obj,
+            user_id=user_id,
+            text="👇 *پس از مطالعه خط قرمزها و گوش دادن به ویس اولیه، جهت ورود به مرحله اول روی دکمه زیر بزنید:*",
+            parse_mode="Markdown",
+            reply_markup=start_kb,
+            track=track
+        )
+    else:
+        await reply_student_msg(
+            message_obj,
+            user_id=user_id,
+            text=(
+                f"{rules_text}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "👇 *لطفاً موارد فوق را با دقت مطالعه نموده و سپس جهت ورود به مرحله اول روی دکمه زیر بزنید:*"
+            ),
+            parse_mode="Markdown",
+            reply_markup=start_kb,
+            track=track
+        )
 
 async def _deliver_stage_content_unlocked(bot, chat_id: int, stage: int, next_stage: int, greeting_name: str = ""):
     student = database.get_student(config.DB_PATH, chat_id)
@@ -984,12 +1249,12 @@ async def _deliver_stage_content_unlocked(bot, chat_id: int, stage: int, next_st
             ):
                 continue
             try:
-                await copy_student_msg(
+                await copy_or_send_stored_message(
                     bot,
-                    user_id=chat_id,
-                    from_chat_id=item["from_chat_id"],
-                    message_id=item["message_id"],
-                    content_type="voice"
+                    target_chat_id=chat_id,
+                    item=item,
+                    content_type="voice",
+                    track_for_student=True
                 )
                 database.record_message_delivery(
                     config.DB_PATH,
@@ -1001,7 +1266,7 @@ async def _deliver_stage_content_unlocked(bot, chat_id: int, stage: int, next_st
                 )
                 await asyncio.sleep(0.3)
             except Exception as e:
-                logger.warning(f"Failed to copy message {item.get('message_id')} for stage {stage}: {e}")
+                logger.warning(f"Failed to deliver message {item.get('message_id')} for stage {stage}: {e}")
     else:
         await send_student_msg(
             bot,
@@ -1014,7 +1279,7 @@ async def _deliver_stage_content_unlocked(bot, chat_id: int, stage: int, next_st
     inline_kb = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}", style="success")]])
 
     extra_stage1_note = (
-        "پس از گوش دادن کامل به ویس‌های مرحله اول، به هاشمی اطلاع دهید و سپس دکمه تایید زیر را لمس نمایید:"
+        "پس از گوش دادن کامل به ویس‌های مرحله اول، به دکتر هاشمی اطلاع دهید (می‌توانید همینجا پیام یا ویس بفرستید) و سپس دکمه تایید زیر را لمس نمایید:"
         if stage == 1
         else "پس از گوش دادن کامل به فایل‌ها، دکمه تایید زیر را لمس نمایید:"
     )
@@ -1037,7 +1302,6 @@ async def _deliver_stage_content_unlocked(bot, chat_id: int, stage: int, next_st
 async def deliver_stage_content(bot, chat_id: int, stage: int, next_stage: int, greeting_name: str = ""):
     lock = get_user_lock(chat_id)
     if lock.locked():
-        # If called from inside an already-locked block for this user, avoid deadlock
         await _deliver_stage_content_unlocked(bot, chat_id, stage, next_stage, greeting_name)
     else:
         async with lock:
@@ -1052,7 +1316,7 @@ async def execute_drip_cycle(bot, force_ignore_interval: bool = False) -> int:
             user_id = st["user_id"]
             async with get_user_lock(user_id):
                 fresh_st = database.get_student(config.DB_PATH, user_id)
-                if not fresh_st or fresh_st.get("current_stage", 1) < 4:
+                if not fresh_st or fresh_st.get("current_stage", 0) < 4:
                     continue
 
                 pkg_msgs = database.get_next_unsent_drip_package(config.DB_PATH, user_id)
@@ -1110,18 +1374,17 @@ async def execute_drip_cycle(bot, force_ignore_interval: bool = False) -> int:
                         ):
                             continue
                         try:
-                            await copy_student_msg(
+                            await copy_or_send_stored_message(
                                 bot,
-                                user_id=user_id,
-                                from_chat_id=m["from_chat_id"],
-                                message_id=m["message_id"],
-                                content_type="voice"
+                                target_chat_id=user_id,
+                                item=m,
+                                content_type="voice",
+                                track_for_student=True
                             )
                             delivered_ids.append(m["id"])
                         except Exception as copy_err:
-                            logger.warning(f"Could not copy drip message {m['id']} to {user_id}: {copy_err}")
+                            logger.warning(f"Could not deliver drip message {m['id']} to {user_id}: {copy_err}")
                         finally:
-                            # Always record so a deleted source message never causes an infinite intro loop
                             database.record_drip_package_delivery(config.DB_PATH, user_id, pkg_id, [m["id"]])
                             database.record_message_delivery(
                                 config.DB_PATH,
@@ -1192,7 +1455,6 @@ async def execute_milestones_check(bot) -> int:
                 continue
 
             try:
-                # Claim milestone first before sending so no race or partial failure resends the header repeatedly
                 database.mark_milestone_sent(config.DB_PATH, user_id, milestone)
 
                 if milestone == 8:
@@ -1211,15 +1473,15 @@ async def execute_milestones_check(bot) -> int:
                 await send_student_msg(bot, user_id=user_id, text=header, parse_mode="Markdown")
                 for item in unsent_msgs:
                     try:
-                        await copy_student_msg(
+                        await copy_or_send_stored_message(
                             bot,
-                            user_id=user_id,
-                            from_chat_id=item["from_chat_id"],
-                            message_id=item["message_id"],
-                            content_type="voice"
+                            target_chat_id=user_id,
+                            item=item,
+                            content_type="voice",
+                            track_for_student=True
                         )
                     except Exception as copy_err:
-                        logger.warning(f"Failed copying milestone {milestone} item {item['id']} to {user_id}: {copy_err}")
+                        logger.warning(f"Failed delivering milestone {milestone} item {item['id']} to {user_id}: {copy_err}")
                     finally:
                         database.record_message_delivery(
                             config.DB_PATH,
@@ -1248,7 +1510,6 @@ async def execute_study_plans_reminders(bot) -> int:
             st = database.get_student(config.DB_PATH, user_id)
             if not st:
                 continue
-            # Re-verify that reminder hasn't already been sent inside lock
             active_plan = database.get_active_study_plan(config.DB_PATH, user_id)
             if not active_plan or active_plan["id"] != plan["id"] or active_plan.get("reminder_sent") == 1:
                 continue
@@ -1301,39 +1562,48 @@ async def execute_inactivity_warnings(bot) -> int:
             fresh_st = database.get_student(config.DB_PATH, user_id)
             if not fresh_st or fresh_st.get("stage_warning_sent") == 1:
                 continue
-            stage = fresh_st.get("current_stage", 1)
+            stage = fresh_st.get("current_stage", 0)
             if stage > 3:
                 continue
 
             database.mark_inactivity_warning_sent(config.DB_PATH, user_id)
             raw_name = fresh_st.get("assigned_name") or fresh_st.get("full_name") or "دانش‌آموز"
             name = escape_md(raw_name)
-            next_stage = stage + 1
-            hours = int(st.get("hours_waiting", 18 if stage == 1 else 24))
+            hours = int(st.get("hours_waiting", 18 if stage <= 1 else 24))
 
-            if stage == 1:
+            if stage == 0:
+                time_desc = f"بیش از ۱۸ ساعت ({hours} ساعت)"
+                action_desc = "خط قرمزها و ویس اولیه را تایید نکرده‌اید و هنوز وارد **مرحله ۱** نشده‌اید!"
+                btn_text = "🟢 ✅ خط قرمزها را خواندم | ورود به مرحله اول 🚀"
+                cb_data = "student_start_stage_1"
+            elif stage == 1:
                 time_desc = f"بیش از ۱۸ ساعت ({hours} ساعت)"
                 action_desc = "ویس‌های **مرحله ۱** را گوش نداده‌اید و وارد مرحله دوم نشده‌اید!"
+                btn_text = "🟢 ✅ گوش دادم | رفتن به مرحله 2 ➡️"
+                cb_data = "student_goto_2"
             elif stage == 2:
                 time_desc = f"بیش از ۲۴ ساعت ({hours} ساعت)"
                 action_desc = "در **مرحله ۲** هستید و هنوز وارد مرحله سوم نشده‌اید!"
+                btn_text = "🟢 ✅ گوش دادم | رفتن به مرحله 3 ➡️"
+                cb_data = "student_goto_3"
             else:
                 time_desc = f"بیش از ۲۴ ساعت ({hours} ساعت)"
                 action_desc = "در **مرحله ۳** هستید و وارد فاز ۴ نشده‌اید!"
+                btn_text = "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
+                cb_data = "student_goto_4"
 
             warning_text = (
                 f"⚠️ **{name} عزیز، یک یادآوری بسیار مهم!** ⏳\n\n"
                 f"الان {time_desc} است که {action_desc}\n"
                 "مسیر مشاوره نیازمند استمرار و تعهد شماست و نباید از برنامه عقب بمانید 🌱\n\n"
                 "📌 **حتماً تا آخر امشب وقت بگذارید، ویس‌های این مرحله را کامل گوش دهید و وارد مرحله بعد شوید.**\n\n"
-                f"🔒 **توجه:** در حال حاضر برای شما محدودیت ایجاد شده است چون هنوز در مرحله {stage} هستید. "
+                f"🔒 **توجه:** در حال حاضر برای شما محدودیت ایجاد شده است چون هنوز در مرحله {max(1, stage)} هستید. "
                 "به محض اینکه وارد فاز ۴ شوید، یک سری ویس‌ها و آموزش‌های بسیار تکمیلی و کلیدی برایتان ارسال می‌شود که جهش بزرگی در روند مطالعه شما ایجاد خواهد کرد 🚀✨\n\n"
                 "👇 همین الان ویس‌ها را گوش دهید و پس از اتمام دکمه زیر را لمس کنید:"
             )
 
-            btn_text = f"🟢 ✅ گوش دادم | رفتن به مرحله {next_stage} ➡️" if next_stage <= 3 else "🚀 🎉 اتمام دوره اصلی | ورود به فاز ۴ 🚀"
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(btn_text, callback_data=f"student_goto_{next_stage}", style="success")],
+                [InlineKeyboardButton(btn_text, callback_data=cb_data, style="success")],
             ])
 
             try:
@@ -1429,16 +1699,19 @@ def generate_students_stats_report() -> str:
         return report
 
     now = database.get_now_utc()
+    today_iran = database.utc_to_iran_date(now)
     for idx, st in enumerate(students, start=1):
         disp_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        st_stage = st.get("current_stage", 0)
+        stage_label = "خط قرمزها (قبل از مرحله ۱)" if st_stage == 0 else (f"مرحله {st_stage}" if st_stage <= 3 else "فاز ۴")
         reg_str = st.get("registered_at")
         day_num = 1
         if reg_str:
             dt = database.parse_db_datetime(reg_str)
             if dt:
-                day_num = max(1, (now - dt).days + 1)
+                day_num = max(1, (today_iran - database.utc_to_iran_date(dt)).days + 1)
         safe_name = escape_md(disp_name)
-        report += f"{idx}. **{safe_name}** ⬅️ روز {day_num}\n"
+        report += f"{idx}. **{safe_name}** ⬅️ روز {day_num} ({stage_label})\n"
 
     return report
 
@@ -1475,11 +1748,14 @@ async def send_database_backup_file(bot, chat_id: int):
 async def _show_existing_student_panel(update, context, student: Dict[str, Any], user_name: str):
     """Displays the appropriate current-stage panel for an already-registered student without duplicating registration."""
     user_id = student["user_id"]
-    stage = student.get("current_stage", 1)
+    stage = student.get("current_stage", 0)
     name = student.get("assigned_name") or user_name
     safe_name = escape_md(name)
     reply_kb = get_student_reply_keyboard(stage)
-    if stage <= 3:
+
+    if stage <= 0:
+        await send_onboarding_intro_sequence(context.bot, update.message, user_id, name, is_admin_preview=False)
+    elif stage <= 3:
         await reply_student_msg(
             update.message,
             user_id=user_id,
@@ -1507,25 +1783,32 @@ async def _show_existing_student_panel(update, context, student: Dict[str, Any],
 async def start_handler(update, context):
     if not update or not update.effective_user or not update.message:
         return
+    if is_duplicate_request(update, action_tag="/start"):
+        return
 
     user_id = update.effective_user.id
     user_name = update.effective_user.full_name or "دانش‌آموز"
     username = update.effective_user.username
 
     async with get_user_lock(user_id):
-        # 1. Check for invite argument (/start inv_XXXXXX) - Checked FIRST so invites always register students
         args = context.args if context else []
+
+        # 1. Check for invite argument (/start inv_XXXXXX)
         if args and len(args) > 0 and args[0].startswith("inv_"):
             code = args[0]
+
+            # Record student's /start message ID so if student is ever deleted, even their /start message is wiped!
+            if not is_admin(user_id, username) and getattr(update.message, "message_id", None):
+                database.record_student_sent_message(config.DB_PATH, user_id, update.message.message_id, content_type="student_start")
+
             pre_existing_student = database.get_student(config.DB_PATH, user_id)
             was_removed = database.is_student_removed(config.DB_PATH, user_id)
 
             success, assigned_name = database.validate_and_use_invite(
-                config.DB_PATH, code, user_id, username, user_name
+                config.DB_PATH, code, user_id, username, user_name, initial_stage=0
             )
 
             if not success:
-                # If this student already used this invite link or is already an active student, open their panel instead of rejecting
                 inv_info = database.get_invite(config.DB_PATH, code)
                 curr_student = database.get_student(config.DB_PATH, user_id)
                 if curr_student and not database.is_student_removed(config.DB_PATH, user_id):
@@ -1540,7 +1823,6 @@ async def start_handler(update, context):
                 )
                 return
 
-            # If student was already active (not removed) and clicked a second invite link, avoid duplicate onboarding & duplicate admin alerts
             if pre_existing_student and not was_removed:
                 updated_st = database.get_student(config.DB_PATH, user_id) or pre_existing_student
                 await _show_existing_student_panel(update, context, updated_st, user_name)
@@ -1548,100 +1830,28 @@ async def start_handler(update, context):
 
             display_name = assigned_name or user_name
             safe_display_name = escape_md(display_name)
-            salutation = f"سلام {safe_display_name} عزیز 🌸"
-            await reply_student_msg(
+
+            # Send 2-step onboarding sequence (Red Lines -> Intro Voice -> 'Enter Stage 1' button) while keeping student at stage 0!
+            await send_onboarding_intro_sequence(
+                context.bot,
                 update.message,
                 user_id=user_id,
-                text=(
-                    f"✨ **{salutation}**\n\n"
-                    "به ربات مشاوره تحصیلی دکتر هاشمی خوش آمدید 🌱🎓\n"
-                    "مسیر آموزشی شما در ۳ مرحله اولیه و سپس فاز تکمیلی طراحی شده است."
-                ),
-                parse_mode="Markdown",
-                reply_markup=get_student_reply_keyboard(1)
+                display_name=display_name,
+                is_admin_preview=False
             )
 
-            intro = database.get_intro_content(config.DB_PATH)
-
-            # Step 1: Send Red Lines and Rules text FIRST (as instructed in the invite message)
-            if intro and intro.get("text_content"):
-                rules_text = intro["text_content"]
-            else:
-                rules_text = (
-                    "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره:**\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
-                    "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
-                    "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
-                )
-
-            # Step 2: Send Dr. Hashemi's Initial Voice/Media (if uploaded and not already delivered)
-            has_intro_media = bool(intro and intro.get("message_id") and intro.get("from_chat_id"))
-            if has_intro_media:
-                await reply_student_msg(
-                    update.message,
-                    user_id=user_id,
-                    text=f"{rules_text}\n\n━━━━━━━━━━━━━━━━━━━━\n🎙 **اکنون ویس اولیه را با دقت گوش دهید:**",
-                    parse_mode="Markdown"
-                )
-                if not database.is_message_delivered(config.DB_PATH, user_id, 0, intro["from_chat_id"], intro["message_id"]):
-                    try:
-                        await copy_student_msg(
-                            context.bot,
-                            user_id=user_id,
-                            from_chat_id=intro["from_chat_id"],
-                            message_id=intro["message_id"],
-                            content_type="voice"
-                        )
-                        database.record_message_delivery(
-                            config.DB_PATH,
-                            user_id,
-                            0,
-                            0,
-                            intro["from_chat_id"],
-                            intro["message_id"]
-                        )
-                        await asyncio.sleep(0.4)
-                    except Exception as e:
-                        logger.warning(f"Could not copy intro media message: {e}")
-
-                start_kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🟢 ✅ خط قرمزها را خواندم و ویس اولیه را گوش دادم | ورود به مرحله اول 🚀", callback_data="student_start_stage_1", style="success")
-                ]])
-                await reply_student_msg(
-                    update.message,
-                    user_id=user_id,
-                    text="👇 *پس از مطالعه خط قرمزها و گوش دادن به ویس اولیه، جهت ورود به مرحله اول روی دکمه زیر بزنید:*",
-                    parse_mode="Markdown",
-                    reply_markup=start_kb
-                )
-            else:
-                start_kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🟢 ✅ مطالعه کردم و متعهدم | ورود به مرحله اول 🚀", callback_data="student_start_stage_1", style="success")
-                ]])
-                await reply_student_msg(
-                    update.message,
-                    user_id=user_id,
-                    text=(
-                        f"{rules_text}\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        "👇 *لطفاً موارد فوق را با دقت مطالعه نموده و سپس جهت ورود به مرحله اول روی دکمه زیر بزنید:*"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=start_kb
-                )
-
-            # Alert admin ONCE that a student just joined and is now in their students list
-            if config.ADMIN_ID and user_id != config.ADMIN_ID:
+            # Alert admin ONCE that a student just joined
+            admin_target = get_active_admin_chat_id()
+            if admin_target and user_id != admin_target:
                 if database.claim_admin_registration_notification(config.DB_PATH, user_id):
                     try:
                         uname = f"@{escape_md(username)}" if username else "بدون یوزرنیم"
                         await safe_bot_send_message(
                             context.bot,
-                            chat_id=config.ADMIN_ID,
-                            text=f"🔔 **دانش‌آموز جدید ثبت‌نام شد:** 👤\n\n"
+                            chat_id=admin_target,
+                            text=f"🔔 **دانش‌آموز جدید وارد ربات شد:** 👤\n\n"
                                  f"• نام: **{safe_display_name}** ({uname})\n"
-                                 "• کد دعوت فعال شد و پیام خط قرمزها برای او ارسال گردید 🎯",
+                                 "• پیام خط قرمزها و ویس اولیه برای او ارسال گردید و آماده ورود به مرحله اول است 🎯",
                             parse_mode="Markdown"
                         )
                     except Exception as e:
@@ -1668,6 +1878,8 @@ async def start_handler(update, context):
         # 4. Existing registered student check
         student = database.get_student(config.DB_PATH, user_id)
         if student:
+            if getattr(update.message, "message_id", None):
+                database.record_student_sent_message(config.DB_PATH, user_id, update.message.message_id, content_type="student_start")
             await _show_existing_student_panel(update, context, student, user_name)
             return
 
@@ -1683,6 +1895,16 @@ async def start_handler(update, context):
 
 async def admin_callback_handler(update, context):
     query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    if is_duplicate_request(update, action_tag=f"cb:{data}"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
     await query.answer()
 
     user_id = query.from_user.id
@@ -1690,8 +1912,6 @@ async def admin_callback_handler(update, context):
     if not is_admin(user_id, username):
         await query.edit_message_text("⛔️ شما به این بخش دسترسی ندارید.")
         return
-
-    data = query.data
 
     if data == "admin_menu":
         active_states[user_id] = None
@@ -1737,6 +1957,82 @@ async def admin_callback_handler(update, context):
         active_states[user_id] = None
         await perform_student_deletion(context.bot, target_uid, notify_chat_id=query.message.chat_id)
 
+    elif data.startswith("admin_reply_to_"):
+        target_uid = int(data.split("_")[-1])
+        st = database.get_student(config.DB_PATH, target_uid)
+        if not st:
+            await safe_reply_text(query.message, "❌ این دانش‌آموز یافت نشد یا حذف شده است.")
+            return
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(raw_name)
+        active_states[user_id] = f"AWAITING_DIRECT_MESSAGE_{target_uid}"
+        await safe_reply_text(
+            query.message,
+            f"✉️ **ارسال پیام یا ویس مستقیم به «{safe_name}»:**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "لطفاً متن، ویس، عکس یا فایل مورد نظر خود را در همین چت بفرستید تا بلافاصله برای این دانش‌آموز ارسال شود.\n\n"
+            "👇 جهت انصراف دکمه زیر را لمس کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data.startswith("admin_setstage_menu_"):
+        target_uid = int(data.split("_")[-1])
+        st = database.get_student(config.DB_PATH, target_uid)
+        if not st:
+            await safe_reply_text(query.message, "❌ دانش‌آموز یافت نشد.")
+            return
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(raw_name)
+        curr_s = st.get("current_stage", 0)
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"مرحله ۱ {'✅' if curr_s == 1 else ''}", callback_data=f"admin_setstage_do_{target_uid}_1", style="success"),
+                InlineKeyboardButton(f"مرحله ۲ {'✅' if curr_s == 2 else ''}", callback_data=f"admin_setstage_do_{target_uid}_2", style="primary"),
+            ],
+            [
+                InlineKeyboardButton(f"مرحله ۳ {'✅' if curr_s == 3 else ''}", callback_data=f"admin_setstage_do_{target_uid}_3", style="primary"),
+                InlineKeyboardButton(f"فاز ۴ {'✅' if curr_s == 4 else ''}", callback_data=f"admin_setstage_do_{target_uid}_4", style="primary"),
+            ],
+            [InlineKeyboardButton("🔙 بازگشت به پرونده دانش‌آموز", callback_data=f"dossier_select_{target_uid}", style="danger")]
+        ])
+        await safe_edit_or_reply(
+            query,
+            f"🔄 **تغییر یا بازنشانی مرحله «{safe_name}»:**\n\n"
+            f"وضعیت فعلی: **{'خط قرمزها (۰)' if curr_s == 0 else f'مرحله {curr_s}'}**\n"
+            "با انتخاب هر مرحله، دانش‌آموز وارد آن مرحله شده و ویس‌های آن مرحله مجدداً برایش ارسال می‌گردد:",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    elif data.startswith("admin_setstage_do_"):
+        parts = data.split("_")
+        target_uid = int(parts[3])
+        new_st = int(parts[4])
+        st = database.get_student(config.DB_PATH, target_uid)
+        if not st:
+            await safe_reply_text(query.message, "❌ دانش‌آموز یافت نشد.")
+            return
+        raw_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
+        safe_name = escape_md(raw_name)
+        database.update_student_stage(config.DB_PATH, target_uid, new_st, reset_delivered_from_stage=True)
+        if new_st <= 3:
+            await deliver_stage_content(context.bot, target_uid, stage=new_st, next_stage=new_st + 1, greeting_name=raw_name)
+        else:
+            await send_student_msg(
+                context.bot,
+                user_id=target_uid,
+                text=f"🌟 **{safe_name} عزیز، شما وارد فاز ۴ (آموزش‌های تکمیلی) شدید!** 🚀",
+                parse_mode="Markdown",
+                reply_markup=get_student_reply_keyboard(4)
+            )
+        await safe_reply_text(
+            query.message,
+            f"✅ وضعیت «{safe_name}» به **مرحله {new_st}** تغییر یافت و محتوای مربوطه برایش ارسال شد.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_reply_keyboard()
+        )
+
     elif data == "admin_manage_stages":
         active_states[user_id] = None
         active_package_ids.pop(user_id, None)
@@ -1754,7 +2050,6 @@ async def admin_callback_handler(update, context):
         st_title = get_stage_display_name(stage_num)
         msgs = database.get_stage_messages(config.DB_PATH, stage_num)
         count = len(msgs)
-        # Viewing a stage must NOT secretly activate recording mode; recording starts only on admin_record_X
         active_states[user_id] = None
         active_package_ids.pop(user_id, None)
 
@@ -1845,30 +2140,32 @@ async def admin_callback_handler(update, context):
                         InlineKeyboardButton(f"🗑 حذف این فایل از {st_title}", callback_data=f"stage_delfile_{m['id']}", style="danger")
                     ]])
                     try:
-                        await context.bot.copy_message(
-                            chat_id=user_id,
-                            from_chat_id=m["from_chat_id"],
-                            message_id=m["message_id"],
+                        await copy_or_send_stored_message(
+                            context.bot,
+                            target_chat_id=user_id,
+                            item=m,
+                            track_for_student=False,
                             reply_markup=del_kb
                         )
                         await asyncio.sleep(0.3)
                     except Exception as e:
-                        logger.warning(f"Could not copy stage message {m['id']}: {e}")
+                        logger.warning(f"Could not preview stage message {m['id']}: {e}")
         else:
             for idx, m in enumerate(msgs, 1):
                 del_kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton(f"🗑 حذف فایل شماره {idx} از {st_title}", callback_data=f"stage_delfile_{m['id']}", style="danger")
                 ]])
                 try:
-                    await context.bot.copy_message(
-                        chat_id=user_id,
-                        from_chat_id=m["from_chat_id"],
-                        message_id=m["message_id"],
+                    await copy_or_send_stored_message(
+                        context.bot,
+                        target_chat_id=user_id,
+                        item=m,
+                        track_for_student=False,
                         reply_markup=del_kb
                     )
                     await asyncio.sleep(0.3)
                 except Exception as e:
-                    logger.warning(f"Could not copy stage message {m['id']}: {e}")
+                    logger.warning(f"Could not preview stage message {m['id']}: {e}")
 
         await safe_reply_text(
             query.message,
@@ -1955,7 +2252,7 @@ async def admin_callback_handler(update, context):
 
     elif data == "admin_record_4_package":
         active_states[user_id] = "RECORD_STAGE_4_PACKAGE"
-        active_package_ids[user_id] = int(get_iran_now().timestamp())
+        active_package_ids[user_id] = database.get_next_package_id(config.DB_PATH)
         await safe_reply_text(
             query.message,
             "📦 **حالت ذخیره‌سازی پکیج چندرسانه‌ای (بخش ۴) فعال شد.** 🟢\n"
@@ -1965,6 +2262,18 @@ async def admin_callback_handler(update, context):
             "👇 پس از پایان ارسال فایل‌های این پکیج، دکمه **«🟢 ✅ اتمام ذخیره پیام‌ها 🟢»** را بزنید.",
             parse_mode="Markdown",
             reply_markup=get_recording_reply_keyboard()
+        )
+
+    elif data == "stage4_split_solo_ask":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔴 بله، همه پکیج‌ها به فایل‌های تکی تفکیک شوند", callback_data="stage4_split_solo", style="danger")],
+            [InlineKeyboardButton("🟢 خیر، انصراف و بازگشت 🔙", callback_data="stage_detail_4", style="success")]
+        ])
+        await safe_reply_text(
+            query.message,
+            "⚠️ **آیا مطمئن هستید که می‌خواهید تمام پکیج‌های چندرسانه‌ای بخش ۴ را به فایل‌های تکی و جداگانه تفکیک کنید؟**",
+            parse_mode="Markdown",
+            reply_markup=kb
         )
 
     elif data == "stage4_split_solo":
@@ -2059,14 +2368,15 @@ async def admin_callback_handler(update, context):
         await safe_reply_text(query.message, f"⏳ در حال ارسال پیش‌نمایش نوبت شماره {target_pkg['index']} ({target_pkg['count']} فایل)...")
         for m in target_pkg["messages"]:
             try:
-                await context.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=m["from_chat_id"],
-                    message_id=m["message_id"]
+                await copy_or_send_stored_message(
+                    context.bot,
+                    target_chat_id=user_id,
+                    item=m,
+                    track_for_student=False
                 )
                 await asyncio.sleep(0.3)
             except Exception as e:
-                logger.warning(f"Could not copy message {m['id']} for preview: {e}")
+                logger.warning(f"Could not preview message {m['id']}: {e}")
 
     elif data.startswith("stage4_send_"):
         pid = int(data.split("_")[-1])
@@ -2089,7 +2399,7 @@ async def admin_callback_handler(update, context):
             st_uid = st["user_id"]
             async with get_user_lock(st_uid):
                 fresh_st = database.get_student(config.DB_PATH, st_uid)
-                if not fresh_st or fresh_st.get("current_stage", 1) < 4:
+                if not fresh_st or fresh_st.get("current_stage", 0) < 4:
                     continue
 
                 unsent_msgs = [
@@ -2136,12 +2446,12 @@ async def admin_callback_handler(update, context):
                         ):
                             continue
                         try:
-                            await copy_student_msg(
+                            await copy_or_send_stored_message(
                                 context.bot,
-                                user_id=st_uid,
-                                from_chat_id=m["from_chat_id"],
-                                message_id=m["message_id"],
-                                content_type="voice"
+                                target_chat_id=st_uid,
+                                item=m,
+                                content_type="voice",
+                                track_for_student=True
                             )
                         finally:
                             database.record_drip_package_delivery(config.DB_PATH, st_uid, pid, [m["id"]])
@@ -2172,7 +2482,7 @@ async def admin_callback_handler(update, context):
     elif data == "admin_intro_menu":
         active_states[user_id] = None
         intro = database.get_intro_content(config.DB_PATH)
-        has_media = bool(intro and intro.get("message_id"))
+        has_media = bool(intro and (intro.get("message_id") or intro.get("file_id")))
         has_rules = bool(intro and intro.get("text_content"))
         media_st = "تنظیم شده (فایل اختصاصی) ✅" if has_media else "ثبت نشده ❌"
         rules_st = "متن اختصاصی شما ✅" if has_rules else "متن پیش‌فرض سیستم 📋"
@@ -2192,39 +2502,14 @@ async def admin_callback_handler(update, context):
         )
 
     elif data == "admin_preview_intro":
-        intro = database.get_intro_content(config.DB_PATH)
-        has_media = bool(intro and intro.get("message_id"))
-        rules_text = intro.get("text_content") if (intro and intro.get("text_content")) else (
-            "📌 **توضیحات مهم و خط قرمزهای مسیر مشاوره (پیش‌فرض):**\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "۱. **تعهد روزانه:** ویس‌ها و آموزش‌ها را با تمرکز کامل در همان روز گوش دهید 🌱\n"
-            "۲. **ارسال دقیق گزارش کار:** مباحث خوانده‌شده و گزارش مطالعه را منظم ارسال کنید 📝\n"
-            "۳. **استمرار و نظم:** این ربات همراه هوشمند شماست تا روز کنکور؛ با تعهد کامل قدم بردارید 🚀🎓"
-        )
-
-        await safe_reply_text(query.message, "👁 **پیش‌نمایش مرحله به مرحله پیام خوش‌آمدگویی:**", parse_mode="Markdown")
-        if has_media:
-            try:
-                await context.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=intro["from_chat_id"],
-                    message_id=intro["message_id"]
-                )
-            except Exception as e:
-                await safe_reply_text(query.message, f"خطا در ارسال فایل معرفی: {e}")
-        else:
-            await safe_reply_text(query.message, "ℹ️ *هنوز فایل یا ویس معرفی بارگذاری نشده است (اختیاری).*", parse_mode="Markdown")
-
-        preview_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 ✅ مطالعه کردم و متعهدم | ورود به مرحله اول 🚀", callback_data="admin_menu", style="success")
-        ]])
-        await safe_reply_text(
+        # Preview in the EXACT same 2-step order that students receive (1. Red Lines text -> 2. Intro Voice -> 3. Enter Stage 1 button)
+        await safe_reply_text(query.message, "👁 **پیش‌نمایش دقیق مرحله به مرحله پیام خوش‌آمدگویی (مشابه دید دانش‌آموز):**", parse_mode="Markdown")
+        await send_onboarding_intro_sequence(
+            context.bot,
             query.message,
-            f"{rules_text}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 *دکمه شروع مرحله اول که دانش‌آموز می‌بیند:*",
-            parse_mode="Markdown",
-            reply_markup=preview_kb
+            user_id=user_id,
+            display_name="دانش‌آموز نمونه",
+            is_admin_preview=True
         )
 
     elif data == "admin_edit_intro_media":
@@ -2234,7 +2519,7 @@ async def admin_callback_handler(update, context):
             "🎙 **بارگذاری ویس یا فایل چندرسانه‌ای معرفی:**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "لطفاً ویس، ویدیو، عکس یا فایل صوتی مورد نظرتان را در همین چت ارسال یا فوروارد کنید.\n"
-            "این فایل به محض ورود دانش‌آموز جدید برای او فرستاده می‌شود.\n\n"
+            "این فایل به محض ورود دانش‌آموز جدید (پس از متن خط قرمزها) برای او فرستاده می‌شود.\n\n"
             "👇 جهت انصراف دکمه زیر را لمس نمایید:",
             parse_mode="Markdown",
             reply_markup=get_recording_reply_keyboard()
@@ -2303,12 +2588,12 @@ async def admin_callback_handler(update, context):
         for st in students:
             st_uid = st["user_id"]
             try:
-                sent_msg = await copy_student_msg(
+                sent_msg = await copy_or_send_stored_message(
                     context.bot,
-                    user_id=st_uid,
-                    from_chat_id=item["from_chat_id"],
-                    message_id=item["message_id"],
-                    content_type="broadcast"
+                    target_chat_id=st_uid,
+                    item=item,
+                    content_type="broadcast",
+                    track_for_student=True
                 )
                 sent_count += 1
                 if should_pin and sent_msg and getattr(sent_msg, "message_id", None):
@@ -2345,7 +2630,7 @@ async def admin_callback_handler(update, context):
     elif data.startswith("admin_record_"):
         stage_num = int(data.split("_")[-1])
         active_states[user_id] = f"RECORD_STAGE_{stage_num}"
-        active_package_ids[user_id] = int(get_iran_now().timestamp())
+        active_package_ids[user_id] = database.get_next_package_id(config.DB_PATH)
         stage_title = get_stage_display_name(stage_num)
 
         await safe_reply_text(
@@ -2382,12 +2667,26 @@ async def admin_callback_handler(update, context):
     elif data.startswith("drip_set_int_"):
         val = data.split("_")[-1]
         database.set_setting(config.DB_PATH, "drip_interval_days", val)
-        await safe_reply_text(query.message, f"✅ فاصله ارسال به **هر {val} روز یکبار** تغییر یافت.", parse_mode="Markdown")
+        interval = int(val)
+        hour = int(database.get_setting(config.DB_PATH, "drip_send_hour", "23"))
+        msg = (
+            "⚙️ **تنظیمات زمان‌بندی ارسال خودکار (بخش ۴):** ⚙️\n\n"
+            f"✅ فاصله ارسال به **هر {interval} روز یکبار** تغییر یافت.\n"
+            f"• **ساعت ارسال در روز نوبت:** ساعت {hour}:۰۰ شب ⏰"
+        )
+        await safe_edit_or_reply(query, msg, parse_mode="Markdown", reply_markup=get_drip_settings_keyboard(interval, hour))
 
     elif data.startswith("drip_set_hour_"):
         val = data.split("_")[-1]
         database.set_setting(config.DB_PATH, "drip_send_hour", val)
-        await safe_reply_text(query.message, f"✅ ساعت ارسال روزانه به **ساعت {val}:۰۰ شب** تغییر یافت.", parse_mode="Markdown")
+        hour = int(val)
+        interval = int(database.get_setting(config.DB_PATH, "drip_interval_days", "2"))
+        msg = (
+            "⚙️ **تنظیمات زمان‌بندی ارسال خودکار (بخش ۴):** ⚙️\n\n"
+            f"• **فاصله زمانی فعلی:** هر {interval} روز یکبار 🗓\n"
+            f"✅ ساعت ارسال روزانه به **ساعت {hour}:۰۰ شب** تغییر یافت."
+        )
+        await safe_edit_or_reply(query, msg, parse_mode="Markdown", reply_markup=get_drip_settings_keyboard(interval, hour))
 
     elif data == "admin_force_drip":
         await safe_reply_text(query.message, "⏳ در حال بررسی و ارسال نوبت ویس جدید به دانش‌آموزان واجد شرایط فاز ۴...")
@@ -2513,8 +2812,8 @@ async def admin_callback_handler(update, context):
             query.message,
             "🗂 👤 **پرونده و اطلاعات ذخیره‌شده دانش‌آموزان:**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "هر پیامی (ویس، ویدیو، عکس، متن) که از چت دانش‌آموز به ربات فوروارد کنید، خودکار در پرونده او ذخیره می‌شود.\n\n"
-            "جهت مشاهده یا ثبت یادداشت دستی، دانش‌آموز مورد نظر را انتخاب کنید:",
+            "هر پیامی که دانش‌آموز در ربات بفرستد یا شما از چت دانش‌آموز به ربات فوروارد کنید، خودکار در پرونده او ذخیره می‌شود.\n\n"
+            "جهت مشاهده پرونده، ارسال پیام به دانش‌آموز یا تغییر مرحله، نام او را انتخاب کنید:",
             parse_mode="Markdown",
             reply_markup=get_students_for_dossier_keyboard(students)
         )
@@ -2528,10 +2827,12 @@ async def admin_callback_handler(update, context):
         name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
         safe_name = escape_md(name)
         cnt = database.get_student_dossier_count(config.DB_PATH, target_uid)
+        curr_s = st.get("current_stage", 0)
+        stage_str = "خط قرمزها (قبل از مرحله ۱)" if curr_s == 0 else (f"مرحله {curr_s}" if curr_s <= 3 else "فاز ۴")
         st_info = (
             f"👤 **پرونده تحصیلی «{safe_name}»**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"• وضعیت مرحله: **مرحله {st['current_stage']}**\n"
+            f"• وضعیت مرحله: **{stage_str}**\n"
             f"• تعداد کل یادداشت‌ها و فایل‌های ثبت‌شده: **{cnt} مورد**\n\n"
             "عملیات مورد نظر را انتخاب کنید:"
         )
@@ -2562,7 +2863,7 @@ async def admin_callback_handler(update, context):
         for idx, n in enumerate(notes, 1):
             mtype = escape_md(n.get("media_type") or "text")
             date_str = str(n.get("created_at") or "")[:16]
-            if n.get("from_chat_id") and n.get("message_id"):
+            if (n.get("from_chat_id") and n.get("message_id")) or n.get("file_id"):
                 try:
                     await safe_bot_send_message(
                         context.bot,
@@ -2570,10 +2871,11 @@ async def admin_callback_handler(update, context):
                         text=f"📌 **مورد شماره {idx} ({mtype}) - ثبت: `{date_str}`:**",
                         parse_mode="Markdown"
                     )
-                    await context.bot.copy_message(
-                        chat_id=user_id,
-                        from_chat_id=n["from_chat_id"],
-                        message_id=n["message_id"]
+                    await copy_or_send_stored_message(
+                        context.bot,
+                        target_chat_id=user_id,
+                        item=n,
+                        track_for_student=False
                     )
                     await asyncio.sleep(0.3)
                 except Exception as e:
@@ -2629,6 +2931,61 @@ async def admin_callback_handler(update, context):
         database.delete_dossier_note(config.DB_PATH, note_id)
         await safe_reply_text(query.message, "🗑 **این مورد از پرونده دانش‌آموز حذف شد.** 🟢", parse_mode="Markdown")
 
+    elif data == "dossier_assign_to_stage_menu":
+        item = pending_dossier_notes.get(user_id)
+        if not item:
+            await safe_reply_text(query.message, "❌ پیام مورد نظر یافت نشد.")
+            return
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎓 افزودن به مرحله ۱", callback_data="dossier_tostage_1", style="success"),
+                InlineKeyboardButton("📚 افزودن به مرحله ۲", callback_data="dossier_tostage_2", style="primary"),
+            ],
+            [
+                InlineKeyboardButton("🧠 افزودن به مرحله ۳", callback_data="dossier_tostage_3", style="primary"),
+                InlineKeyboardButton("💡 افزودن به بخش ۴ (تکی)", callback_data="dossier_tostage_4", style="primary"),
+            ],
+            [
+                InlineKeyboardButton("🎯 روز ۸", callback_data="dossier_tostage_8", style="primary"),
+                InlineKeyboardButton("🏆 روز ۳۰", callback_data="dossier_tostage_30", style="primary"),
+            ],
+            [InlineKeyboardButton("❌ انصراف", callback_data="dossier_assign_cancel", style="danger")]
+        ])
+        await safe_edit_or_reply(
+            query,
+            "📥 **این فایل به کدام مرحله اضافه شود؟**",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    elif data.startswith("dossier_tostage_"):
+        st_num = int(data.split("_")[-1])
+        item = pending_dossier_notes.pop(user_id, None)
+        if not item:
+            await safe_reply_text(query.message, "❌ پیام مورد نظر منقضی شده یا یافت نشد.")
+            return
+        database.add_stage_message(
+            config.DB_PATH,
+            stage=st_num,
+            from_chat_id=item["from_chat_id"],
+            message_id=item["message_id"],
+            caption=item.get("caption") or item.get("text_content"),
+            package_id=None,
+            file_unique_id=item.get("file_unique_id"),
+            file_id=item.get("file_id"),
+            media_type=item.get("media_type"),
+            text_content=item.get("text_content")
+        )
+        st_title = get_stage_display_name(st_num)
+        cnt = len(database.get_stage_messages(config.DB_PATH, st_num))
+        await safe_edit_or_reply(
+            query,
+            f"✅ **فایل با موفقیت به «{st_title}» اضافه شد!** 🟢\n"
+            f"📊 مجموع فایل‌های این مرحله: **{cnt} فایل**",
+            parse_mode="Markdown",
+            reply_markup=get_stage_action_keyboard(st_num, has_content=True)
+        )
+
     elif data.startswith("dossier_assign_"):
         if data == "dossier_assign_cancel":
             pending_dossier_notes.pop(user_id, None)
@@ -2646,7 +3003,8 @@ async def admin_callback_handler(update, context):
                     message_id=item.get("message_id"),
                     media_type=item.get("media_type", "text"),
                     caption=item.get("caption"),
-                    text_content=item.get("text_content")
+                    text_content=item.get("text_content"),
+                    file_id=item.get("file_id")
                 )
                 st = database.get_student(config.DB_PATH, target_uid)
                 name = (st.get("assigned_name") or st.get("full_name") or "دانش‌آموز") if st else "دانش‌آموز"
@@ -2682,6 +3040,16 @@ async def admin_callback_handler(update, context):
 
 async def student_callback_handler(update, context):
     query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    if is_duplicate_request(update, action_tag=f"st_cb:{data}"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+
     user_id = query.from_user.id
 
     if query.message and getattr(query.message, "message_id", None):
@@ -2708,13 +3076,11 @@ async def student_callback_handler(update, context):
             return
 
         await query.answer()
-        data = query.data
         raw_name = student.get("assigned_name") or student.get("full_name") or "دانش‌آموز"
         safe_name = escape_md(raw_name)
-        curr_stage = student.get("current_stage", 1)
+        curr_stage = student.get("current_stage", 0)
 
         if data == "student_start_stage_1":
-            # Prevent resetting stage or re-sending if already past stage 1
             if curr_stage > 1:
                 await reply_student_msg(
                     query.message,
@@ -2725,9 +3091,8 @@ async def student_callback_handler(update, context):
                 )
                 return
 
-            # If Stage 1 messages were already delivered (e.g. student double-clicked the start stage 1 button), don't duplicate the header
             st1_msgs = database.get_stage_messages(config.DB_PATH, 1)
-            already_started_st1 = bool(st1_msgs) and all(
+            already_started_st1 = (curr_stage == 1) and bool(st1_msgs) and all(
                 database.is_message_delivered(config.DB_PATH, user_id, m["id"], m.get("from_chat_id"), m.get("message_id"))
                 for m in st1_msgs
             )
@@ -2739,7 +3104,7 @@ async def student_callback_handler(update, context):
                     user_id=user_id,
                     text=(
                         f"👏 **آفرین {safe_name} عزیز! ورود به مرحله اول با موفقیت ثبت شد.** 🌱✨\n"
-                        "فایل‌ها و ویس‌های این مرحله برای شما ارسال می‌شوند:"
+                        "فایل‌ها و ویس‌های مرحله اول برای شما ارسال می‌شوند:"
                     ),
                     parse_mode="Markdown",
                     reply_markup=get_student_reply_keyboard(1)
@@ -2749,7 +3114,22 @@ async def student_callback_handler(update, context):
 
         elif data.startswith("student_goto_"):
             next_stage = int(data.split("_")[-1])
-            # Enforce strict sequential stage progression (no duplicate stage entries, no jumping backwards)
+            # If student was still at stage 0 (Intro) and somehow triggered goto_2, route them to stage 1 first!
+            if curr_stage <= 0:
+                database.update_student_stage(config.DB_PATH, user_id, 1)
+                await reply_student_msg(
+                    query.message,
+                    user_id=user_id,
+                    text=(
+                        f"👏 **آفرین {safe_name} عزیز! ورود به مرحله اول با موفقیت ثبت شد.** 🌱✨\n"
+                        "فایل‌ها و ویس‌های مرحله اول برای شما ارسال می‌شوند:"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=get_student_reply_keyboard(1)
+                )
+                await _deliver_stage_content_unlocked(context.bot, user_id, stage=1, next_stage=2, greeting_name=raw_name)
+                return
+
             if next_stage <= curr_stage:
                 await reply_student_msg(
                     query.message,
@@ -2807,7 +3187,7 @@ async def student_callback_handler(update, context):
                 query.message,
                 user_id=user_id,
                 text=(
-                    f"📝 **{safe_name} عزیز، لطفاً لیست مباحثی که تا امروز مطالعه کرده‌اید را تایپ کنید و بفرستید:**\n\n"
+                    f"📝 **{safe_name} عزیز، لطفاً لیست مباحثی که تا امروز مطالعه کرده‌اید را تایپ کنید (یا ویس/عکس بفرستید):**\n\n"
                     "💡 *مثال:* زیست: گفتار ۱ فصل ۳ تمام شد و ۵۰ تست زدم. شیمی: تا صفحه ۴۰ خوانده شد و ویدیو تحلیل رو دیدم."
                 ),
                 parse_mode="Markdown"
@@ -2824,6 +3204,18 @@ async def message_collector(update, context):
     msg = update.message
     text = (msg.text or "").strip()
 
+    # Deduplicate exact update/message_id and debounce rapid double-taps on menu buttons
+    is_menu_tap = any(k in text for k in (
+        "ساخت لینک جدید (با نام)", "حذف دانش‌آموز ❌", "مدیریت و مشاهده محتوای مراحل", "افزودن فایل به بخش ۴ 💡",
+        "ارسال پیام همگانی (پین‌دار)", "پیام خوش‌آمد و خط قرمزها", "پرونده و یادداشت‌های دانش‌آموزان",
+        "محتوای روز ۸ و ۳۰ 🏆", "برنامه درسی دوره‌ای", "تنظیمات ارسال خودکار ⚙️",
+        "آمار و وضعیت دانش‌آموزان 📈", "تست جمله انگیزشی ۷ صبح", "دریافت بکاپ دیتابیس 📦", "منوی اصلی مدیریت 👑",
+        "گوش دادم | رفتن به مرحله", "خط قرمزها را خواندم | ورود به مرحله", "اتمام دوره اصلی | ورود به فاز ۴",
+        "ارسال لیست مباحث خوانده‌شده", "پیام به دکتر هاشمی 💬"
+    ))
+    if is_duplicate_request(update, action_tag=(f"btn:{text}" if is_menu_tap else "")):
+        return
+
     # ==========================
     # 1. ADMIN ACTIONS & BUTTONS
     # ==========================
@@ -2832,6 +3224,7 @@ async def message_collector(update, context):
         is_recording_media = (
             curr_admin_state.startswith("RECORD_STAGE_")
             or curr_admin_state in ("AWAITING_INTRO_MEDIA", "AWAITING_BROADCAST_CONTENT")
+            or curr_admin_state.startswith("AWAITING_DIRECT_MESSAGE_")
         )
         if msg.document:
             file_name = (msg.document.file_name or "").lower()
@@ -2880,7 +3273,11 @@ async def message_collector(update, context):
             active_states[user_id] = None
             pkg_id = active_package_ids.pop(user_id, None)
 
-            if curr_state in ("AWAITING_INTRO_CONTENT", "AWAITING_INTRO_MEDIA", "AWAITING_INTRO_RULES", "AWAITING_BROADCAST_CONTENT", "AWAITING_DELETE_STUDENT_NAME") or curr_state.startswith("AWAITING_MANUAL_DOSSIER_"):
+            if (
+                curr_state in ("AWAITING_INTRO_CONTENT", "AWAITING_INTRO_MEDIA", "AWAITING_INTRO_RULES", "AWAITING_BROADCAST_CONTENT", "AWAITING_DELETE_STUDENT_NAME")
+                or curr_state.startswith("AWAITING_MANUAL_DOSSIER_")
+                or curr_state.startswith("AWAITING_DIRECT_MESSAGE_")
+            ):
                 pending_broadcast.pop(user_id, None)
                 pending_dossier_notes.pop(user_id, None)
                 await safe_reply_text(
@@ -3019,7 +3416,7 @@ async def message_collector(update, context):
         elif "پیام خوش‌آمد و خط قرمزها" in text:
             active_states[user_id] = None
             intro = database.get_intro_content(config.DB_PATH)
-            has_media = bool(intro and intro.get("message_id"))
+            has_media = bool(intro and (intro.get("message_id") or intro.get("file_id")))
             has_rules = bool(intro and intro.get("text_content"))
             media_st = "تنظیم شده (فایل اختصاصی) ✅" if has_media else "ثبت نشده ❌"
             rules_st = "متن اختصاصی شما ✅" if has_rules else "متن پیش‌فرض سیستم 📋"
@@ -3050,8 +3447,7 @@ async def message_collector(update, context):
                 msg,
                 "🗂 👤 **پرونده و اطلاعات ذخیره‌شده دانش‌آموزان:**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "جهت مشاهده محتویات پرونده یا ثبت یادداشت دستی، دانش‌آموز مورد نظر را انتخاب کنید:\n"
-                "*(همچنین می‌توانید مستقیماً هر پیامی از دانش‌آموز را به این چت فوروارد کنید تا ذخیره شود)*",
+                "جهت مشاهده محتویات پرونده، ارسال پیام مستقیم یا ثبت یادداشت دستی، دانش‌آموز مورد نظر را انتخاب کنید:",
                 parse_mode="Markdown",
                 reply_markup=get_students_for_dossier_keyboard(students)
             )
@@ -3130,6 +3526,51 @@ async def message_collector(update, context):
 
         state = active_states.get(user_id)
 
+        # C0) Admin Direct Reply to a Student Notification (via Telegram Reply or AWAITING_DIRECT_MESSAGE_<uid>)
+        reply_to_msg = getattr(msg, "reply_to_message", None)
+        direct_target_uid = None
+        if state and state.startswith("AWAITING_DIRECT_MESSAGE_"):
+            direct_target_uid = int(state.split("_")[-1])
+        elif not state and reply_to_msg and getattr(reply_to_msg, "message_id", None) in admin_reply_targets:
+            direct_target_uid = admin_reply_targets[reply_to_msg.message_id]
+
+        if direct_target_uid:
+            active_states[user_id] = None
+            st = database.get_student(config.DB_PATH, direct_target_uid)
+            raw_name = (st.get("assigned_name") or st.get("full_name") or "دانش‌آموز") if st else "دانش‌آموز"
+            safe_name = escape_md(raw_name)
+            try:
+                if text and not (msg.voice or msg.audio or msg.video or msg.photo or msg.document):
+                    await send_student_msg(
+                        context.bot,
+                        user_id=direct_target_uid,
+                        text=f"🩺 **پیام از طرف دکتر هاشمی:**\n━━━━━━━━━━━━━━━━━━━━\n{text}",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await send_student_msg(
+                        context.bot,
+                        user_id=direct_target_uid,
+                        text="🩺 **پیام/ویس جدید از طرف دکتر هاشمی:**",
+                        parse_mode="Markdown"
+                    )
+                    await copy_student_msg(
+                        context.bot,
+                        user_id=direct_target_uid,
+                        from_chat_id=msg.chat_id,
+                        message_id=msg.message_id,
+                        content_type="admin_direct"
+                    )
+                await safe_reply_text(
+                    msg,
+                    f"✅ **پیام شما با موفقیت برای «{safe_name}» ارسال شد.** 🟢",
+                    parse_mode="Markdown",
+                    reply_markup=get_admin_reply_keyboard()
+                )
+            except Exception as e:
+                await safe_reply_text(msg, f"❌ خطا در ارسال پیام به دانش‌آموز: {e}", reply_markup=get_admin_reply_keyboard())
+            return
+
         # C1) Natural language chat command for deleting a student (when not recording content)
         if not is_recording_media and state not in ("AWAITING_STUDENT_NAME", "AWAITING_INTRO_RULES") and not (state and state.startswith("AWAITING_MANUAL_DOSSIER_")):
             is_del, del_name = parse_admin_delete_intent(text)
@@ -3171,17 +3612,20 @@ async def message_collector(update, context):
         # D1) State: Waiting for intro media
         if state == "AWAITING_INTRO_MEDIA":
             active_states[user_id] = None
+            _, f_id, m_type = extract_media_info(msg)
             caption = msg.caption or (text if text else None)
             database.set_intro_media(
                 config.DB_PATH,
                 from_chat_id=msg.chat_id,
                 message_id=msg.message_id,
-                caption=caption
+                caption=caption,
+                file_id=f_id,
+                media_type=m_type
             )
             await safe_reply_text(
                 msg,
                 "🎉 **ویس/فایل معرفی دکتر هاشمی با موفقیت ذخیره شد!** 🟢✨\n"
-                "از این پس هنگام ورود دانش‌آموز جدید با لینک اختصاصی، این فایل برای او ارسال خواهد شد.",
+                "از این پس هنگام ورود دانش‌آموز جدید با لینک اختصاصی، این فایل (پس از متن خط قرمزها) برای او ارسال خواهد شد.",
                 parse_mode="Markdown",
                 reply_markup=get_admin_reply_keyboard()
             )
@@ -3234,11 +3678,14 @@ async def message_collector(update, context):
 
         # E) State: Waiting for broadcast content
         if state == "AWAITING_BROADCAST_CONTENT":
+            _, f_id, m_type = extract_media_info(msg)
             pending_broadcast[user_id] = {
                 "from_chat_id": msg.chat_id,
                 "message_id": msg.message_id,
-                "text": text,
-                "caption": msg.caption
+                "text_content": text,
+                "caption": msg.caption,
+                "file_id": f_id,
+                "media_type": m_type
             }
             active_states[user_id] = None
             await safe_reply_text(
@@ -3298,7 +3745,7 @@ async def message_collector(update, context):
 
         # G) State: Recording forwarded messages for a stage
         if state and state.startswith("RECORD_STAGE_"):
-            file_uid = extract_media_unique_id(msg)
+            file_uid, file_id, media_type = extract_media_info(msg)
             if state == "RECORD_STAGE_4_SOLO":
                 caption = msg.caption or (text[:50] if text else None)
                 database.add_stage_message(
@@ -3308,7 +3755,10 @@ async def message_collector(update, context):
                     message_id=msg.message_id,
                     caption=caption,
                     package_id=None,
-                    file_unique_id=file_uid
+                    file_unique_id=file_uid,
+                    file_id=file_id,
+                    media_type=media_type,
+                    text_content=text if text else None
                 )
                 tot_pkg = database.get_stage_4_package_count(config.DB_PATH)
                 await safe_reply_text(
@@ -3324,7 +3774,7 @@ async def message_collector(update, context):
             elif state in ("RECORD_STAGE_4_PACKAGE", "RECORD_STAGE_4"):
                 pkg_id = active_package_ids.get(user_id)
                 if not pkg_id:
-                    pkg_id = int(get_iran_now().timestamp())
+                    pkg_id = database.get_next_package_id(config.DB_PATH)
                     active_package_ids[user_id] = pkg_id
 
                 caption = msg.caption or (text[:50] if text else None)
@@ -3335,7 +3785,10 @@ async def message_collector(update, context):
                     message_id=msg.message_id,
                     caption=caption,
                     package_id=pkg_id,
-                    file_unique_id=file_uid
+                    file_unique_id=file_uid,
+                    file_id=file_id,
+                    media_type=media_type,
+                    text_content=text if text else None
                 )
 
                 conn = database.get_connection(config.DB_PATH)
@@ -3365,7 +3818,10 @@ async def message_collector(update, context):
                     from_chat_id=msg.chat_id,
                     message_id=msg.message_id,
                     caption=caption,
-                    file_unique_id=file_uid
+                    file_unique_id=file_uid,
+                    file_id=file_id,
+                    media_type=media_type,
+                    text_content=text if text else None
                 )
                 count = len(database.get_stage_messages(config.DB_PATH, stage_num))
                 if count == before_cnt:
@@ -3387,21 +3843,10 @@ async def message_collector(update, context):
                     )
                 return
 
-        # H) Student Dossier Auto-Save from Forwarded Messages
+        # H) Student Dossier Auto-Save & Smart Disambiguation from Forwarded Messages
         is_forwarded = bool(msg.forward_date or msg.forward_from or msg.forward_sender_name or getattr(msg, "forward_origin", None))
         if is_forwarded:
-            if msg.voice:
-                media_type = "voice"
-            elif msg.audio:
-                media_type = "audio"
-            elif msg.video or msg.video_note:
-                media_type = "video"
-            elif msg.photo:
-                media_type = "photo"
-            elif msg.document:
-                media_type = "document"
-            else:
-                media_type = "text"
+            file_uid, file_id, media_type = extract_media_info(msg)
             caption = msg.caption
             text_content = msg.text
 
@@ -3422,8 +3867,8 @@ async def message_collector(update, context):
             elif msg.forward_sender_name:
                 sender_name = msg.forward_sender_name
 
-            # Check 1: Direct match by Telegram User ID
-            if target_student_id:
+            # Check 1: Direct match by Telegram User ID (and not the admin themselves!)
+            if target_student_id and target_student_id != user_id:
                 st = database.get_student(config.DB_PATH, target_student_id)
                 if st:
                     note_id = database.add_student_dossier_note(
@@ -3433,7 +3878,8 @@ async def message_collector(update, context):
                         message_id=msg.message_id,
                         media_type=media_type,
                         caption=caption,
-                        text_content=text_content
+                        text_content=text_content,
+                        file_id=file_id
                     )
                     st_name = st.get("assigned_name") or st.get("full_name") or "دانش‌آموز"
                     safe_name = escape_md(st_name)
@@ -3454,8 +3900,10 @@ async def message_collector(update, context):
                     )
                     return
 
-            # Check 2: Match by Sender Name (e.g. forward with privacy)
-            matches = database.find_students_by_name(config.DB_PATH, sender_name) if sender_name else []
+            # Check 2: Match by Sender Name (only if sender is not the admin)
+            matches = []
+            if sender_name and target_student_id != user_id:
+                matches = [s for s in database.find_students_by_name(config.DB_PATH, sender_name) if s["user_id"] != user_id]
             if len(matches) == 1:
                 matched_st = matches[0]
                 m_uid = matched_st["user_id"]
@@ -3466,7 +3914,8 @@ async def message_collector(update, context):
                     message_id=msg.message_id,
                     media_type=media_type,
                     caption=caption,
-                    text_content=text_content
+                    text_content=text_content,
+                    file_id=file_id
                 )
                 st_name = matched_st.get("assigned_name") or matched_st.get("full_name") or "دانش‌آموز"
                 safe_name = escape_md(st_name)
@@ -3487,38 +3936,43 @@ async def message_collector(update, context):
                 )
                 return
 
-            # Check 3: Ambiguous or unlinked forward -> Ask admin to assign to a student
+            # Check 3: Ambiguous or admin-forwarded media -> Let admin choose whether to add to a Stage or assign to a Student Dossier!
             pending_dossier_notes[user_id] = {
                 "from_chat_id": msg.chat_id,
                 "message_id": msg.message_id,
                 "media_type": media_type,
                 "caption": caption,
                 "text_content": text_content,
+                "file_unique_id": file_uid,
+                "file_id": file_id,
                 "sender_name": sender_name
             }
             all_students = database.list_students(config.DB_PATH)
-            if not all_students:
-                await safe_reply_text(msg, "ℹ️ هنوز هیچ دانش‌آموزی در ربات ثبت‌نام نکرده است.")
-                return
-
             candidates = matches if matches else all_students
             prompt_name = f" از «{escape_md(sender_name)}»" if sender_name else ""
             await safe_reply_text(
                 msg,
-                f"📥 **پیام فوروارد شده{prompt_name} دریافت شد.**\n"
+                f"📥 **پیام/فایل فوروارد شده{prompt_name} دریافت شد.**\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "جهت ثبت این پیام در پرونده، لطفاً دانش‌آموز مربوطه را از لیست زیر انتخاب فرمایید:",
+                "لطفاً مشخص کنید این فایل در پرونده کدام دانش‌آموز ذخیره شود، یا به محتوای یکی از مراحل اضافه گردد:",
                 parse_mode="Markdown",
                 reply_markup=get_dossier_assign_keyboard(candidates)
             )
             return
 
-        # I) Stateless Fallback for Admin Plain Text:
-        # If the admin types a student name (e.g. "خودم", "نگار", "لینک علی") even when state was None/reset,
-        # immediately generate and send the invite link so the bot never ignores the admin!
+        # I) Explicit Invite Link Prefix Only (when state is None)
+        # Only creates an invite link if the admin explicitly starts text with "لینک " or "ساخت لینک "
         if text and not text.startswith("/") and len(text) <= 60:
-            await create_and_send_invite_link(msg, context.bot, user_id, text)
-            return
+            if any(text.startswith(p) for p in ("ساخت لینک ", "لینک دعوت ", "لینک برای ", "لینک ")):
+                await create_and_send_invite_link(msg, context.bot, user_id, text)
+                return
+
+            # If it's a single short student name (1-3 words, no punctuation/verbs), offer a 1-click button or create if state was lost
+            words = text.split()
+            if 1 <= len(words) <= 3 and len(text) <= 30 and not any(ch in text for ch in ("?", "؟", ".", ":", "!", "\n")):
+                await create_and_send_invite_link(msg, context.bot, user_id, text)
+                return
+        return
 
     # ==========================
     # 2. STUDENT ACTIONS & BUTTONS
@@ -3537,22 +3991,58 @@ async def message_collector(update, context):
         raw_name = student.get("assigned_name") or student.get("full_name") or "دانش‌آموز"
         name = escape_md(raw_name)
 
-        # Check student bottom keyboard buttons FIRST so tapping a menu button while in AWAITING_STUDY_REPORT never submits the button text as a report
-        if "ارسال لیست مباحث" in text:
+        # 2A) Student Bottom Keyboard: Study Report Button
+        if "ارسال لیست مباحث خوانده‌شده" in text:
             active_states[user_id] = "AWAITING_STUDY_REPORT"
             await reply_student_msg(
                 msg,
                 user_id=user_id,
                 text=(
-                    f"📝 **{name} عزیز، لطفاً لیست مباحثی که مطالعه کرده‌اید را تایپ کنید و بفرستید:**\n\n"
+                    f"📝 **{name} عزیز، لطفاً لیست مباحثی که مطالعه کرده‌اید را تایپ کنید (یا ویس/عکس بفرستید):**\n\n"
                     "💡 *مثال:* زیست: گفتار ۱ فصل ۳ تمام شد و ۵۰ تست زدم. شیمی: تا صفحه ۴۰ خوانده شد و ویدیو تحلیل رو دیدم."
                 ),
                 parse_mode="Markdown"
             )
             return
 
-        if "گوش دادم" in text or "اتمام دوره اصلی" in text or "ورود به فاز ۴" in text:
+        # 2B) Student Bottom Keyboard: Stage Progression Buttons (Stage 0 -> 1, Stage 1 -> 2, Stage 2 -> 3, Stage 3 -> 4)
+        if ("خط قرمزها را خواندم" in text and "ورود به مرحله" in text) or text.startswith("🟢 ✅ خط قرمزها"):
             active_states[user_id] = None
+            if curr_stage <= 0:
+                database.update_student_stage(config.DB_PATH, user_id, 1)
+                await reply_student_msg(
+                    msg,
+                    user_id=user_id,
+                    text=(
+                        f"👏 **آفرین {name} عزیز! ورود به مرحله اول با موفقیت ثبت شد.** 🌱✨\n"
+                        "فایل‌ها و ویس‌های مرحله اول برای شما ارسال می‌شوند:"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=get_student_reply_keyboard(1)
+                )
+                await _deliver_stage_content_unlocked(context.bot, user_id, stage=1, next_stage=2, greeting_name=raw_name)
+            else:
+                await _deliver_stage_content_unlocked(context.bot, user_id, stage=curr_stage, next_stage=curr_stage + 1, greeting_name=raw_name)
+            return
+
+        if ("گوش دادم" in text and "رفتن به مرحله" in text) or ("اتمام دوره اصلی" in text and "ورود به فاز ۴" in text):
+            active_states[user_id] = None
+            # Safety guard: if student was still at Stage 0 (Red Lines), enter Stage 1 first instead of skipping Stage 1!
+            if curr_stage <= 0:
+                database.update_student_stage(config.DB_PATH, user_id, 1)
+                await reply_student_msg(
+                    msg,
+                    user_id=user_id,
+                    text=(
+                        f"👏 **آفرین {name} عزیز! ورود به مرحله اول با موفقیت ثبت شد.** 🌱✨\n"
+                        "فایل‌ها و ویس‌های مرحله اول برای شما ارسال می‌شوند:"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=get_student_reply_keyboard(1)
+                )
+                await _deliver_stage_content_unlocked(context.bot, user_id, stage=1, next_stage=2, greeting_name=raw_name)
+                return
+
             if curr_stage >= 4:
                 await reply_student_msg(
                     msg,
@@ -3566,7 +4056,6 @@ async def message_collector(update, context):
                 )
                 return
 
-            # Prevent accidental double-tap on the same bottom keyboard button from skipping a stage
             norm_btn = database.convert_digits_to_english(text)
             m_target = re.search(r"رفتن به مرحله\s*(\d+)", norm_btn)
             if m_target:
@@ -3618,7 +4107,7 @@ async def message_collector(update, context):
                 user_id=user_id,
                 text=(
                     "💬 **ارتباط مستقیم با دکتر هاشمی:**\n\n"
-                    "جهت ارسال گزارش کار، سوالات درسی یا ارتباط با مشاور، وارد پی‌وی زیر شوید:\n"
+                    "می‌توانید پیام، ویس یا گزارش کار خود را همینجا بفرستید تا مستقیماً برای دکتر هاشمی ارسال شود، یا وارد پی‌وی زیر شوید:\n"
                     "👉 @Hojjat_hshmi 🩺"
                 ),
                 parse_mode="Markdown",
@@ -3626,81 +4115,121 @@ async def message_collector(update, context):
             )
             return
 
-        # A) State: Student typing or sending their study report
-        st_state = active_states.get(user_id)
-        if st_state == "AWAITING_STUDY_REPORT":
-            report_content = text or (msg.caption or "").strip()
-            has_media_report = bool(msg.voice or msg.photo or msg.document or msg.video or msg.audio)
-            if not report_content and not has_media_report:
-                return
-
-            active_states[user_id] = None
-            saved_text = report_content if report_content else "[گزارش چندرسانه‌ای / فایل]"
-            report_result = database.submit_study_plan_report(config.DB_PATH, user_id, saved_text)
-            dur = report_result["duration_days"] if report_result else 7
-
-            # Also save student report in their dossier automatically
-            database.add_student_dossier_note(
-                config.DB_PATH,
-                user_id=user_id,
-                from_chat_id=msg.chat_id if has_media_report else None,
-                message_id=msg.message_id if has_media_report else None,
-                media_type="report",
-                caption=msg.caption,
-                text_content=saved_text
-            )
-
-            safe_text = escape_md(saved_text)
-
+        if "این صفحه را همیشه پین داشته باشید" in text:
             await reply_student_msg(
                 msg,
                 user_id=user_id,
-                text=(
-                    f"✅ **{name} عزیز، گزارش مباحث با موفقیت برای دکتر هاشمی ارسال شد!** 🌱✨\n\n"
-                    "پس از بررسی، برنامه دوره بعدی برایتان تنظیم خواهد شد 🎯"
-                ),
+                text="📌 این چت را در تلگرام خود پین (Pin) نگه دارید؛ ویس‌ها و نکات جدید دکتر هاشمی در همین صفحه برایتان ارسال می‌شود 🌱",
                 parse_mode="Markdown",
                 reply_markup=get_student_reply_keyboard(curr_stage)
             )
-
-            # Alert admin
-            admin_target = config.ADMIN_ID
-            if admin_target:
-                report_alert = (
-                    f"📩🔔 **گزارش مباحث خوانده‌شده از طرف «{name}»:**\n\n"
-                    f"📝 *متن گزارش:*\n{safe_text}\n\n"
-                    f"🎯 *برنامه دوره قبلی:* {dur} روزه (تکمیل شد)\n"
-                    "👇 جهت تایید و فعال‌سازی برنامه دوره جدید، دکمه زیر را لمس کنید:"
-                )
-                admin_kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"➕ تنظیم برنامه دوره جدید برای {raw_name}", callback_data=f"plan_user_{user_id}", style="success")
-                ]])
-                try:
-                    if has_media_report:
-                        await context.bot.copy_message(
-                            chat_id=admin_target,
-                            from_chat_id=msg.chat_id,
-                            message_id=msg.message_id
-                        )
-                    await safe_bot_send_message(
-                        context.bot,
-                        chat_id=admin_target,
-                        text=report_alert,
-                        parse_mode="Markdown",
-                        reply_markup=admin_kb
-                    )
-                except Exception as e:
-                    logger.error(f"Could not alert admin about report: {e}")
             return
+
+        # 2C) Any Student Message / Voice / Photo / Study Report -> Save in Dossier & Forward to Admin!
+        st_state = active_states.get(user_id)
+        is_explicit_report = (st_state == "AWAITING_STUDY_REPORT")
+        _, file_id, media_type = extract_media_info(msg)
+        report_content = text or (msg.caption or "").strip()
+        has_media_report = bool(msg.voice or msg.photo or msg.document or msg.video or msg.audio or msg.video_note)
+
+        if not report_content and not has_media_report:
+            return
+
+        active_states[user_id] = None
+        saved_text = report_content if report_content else f"[فایل/رسانه ارسالی: {media_type}]"
+
+        # If student has an active study plan (or was in AWAITING_STUDY_REPORT), record in study_plans
+        active_plan = database.get_active_study_plan(config.DB_PATH, user_id)
+        report_result = None
+        if is_explicit_report or active_plan:
+            report_result = database.submit_study_plan_report(config.DB_PATH, user_id, saved_text)
+        dur = report_result["duration_days"] if report_result else (active_plan["duration_days"] if active_plan else None)
+
+        # Always save student message/report in their dossier automatically
+        database.add_student_dossier_note(
+            config.DB_PATH,
+            user_id=user_id,
+            from_chat_id=msg.chat_id if has_media_report else None,
+            message_id=msg.message_id if has_media_report else None,
+            media_type="report" if is_explicit_report else media_type,
+            caption=msg.caption,
+            text_content=saved_text,
+            file_id=file_id
+        )
+
+        safe_text = escape_md(saved_text)
+
+        if is_explicit_report:
+            ack_text = (
+                f"✅ **{name} عزیز، گزارش مباحث شما با موفقیت برای دکتر هاشمی ارسال و در پرونده شما ثبت شد!** 🌱✨\n\n"
+                "پس از بررسی، برنامه دوره بعدی برایتان تنظیم خواهد شد 🎯"
+            )
+        else:
+            ack_text = (
+                f"✅ **{name} عزیز، پیام شما دریافت شد و مستقیماً برای دکتر هاشمی ارسال گردید.** 🌱✨"
+            )
+
+        await reply_student_msg(
+            msg,
+            user_id=user_id,
+            text=ack_text,
+            parse_mode="Markdown",
+            reply_markup=get_student_reply_keyboard(curr_stage)
+        )
+
+        # Alert Admin with quick action buttons AND reply-mapping
+        admin_target = get_active_admin_chat_id()
+        if admin_target:
+            stage_label = "خط قرمزها (قبل از مرحله ۱)" if curr_stage == 0 else (f"مرحله {curr_stage}" if curr_stage <= 3 else "فاز ۴")
+            header_title = "📩🔔 **گزارش مباحث خوانده‌شده**" if is_explicit_report else "💬🔔 **پیام جدید از دانش‌آموز**"
+            plan_line = f"\n🎯 *برنامه دوره:* {dur} روزه" if dur else ""
+            report_alert = (
+                f"{header_title} از طرف **«{name}»** ({stage_label}):\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"📝 *متن/توضیح:*\n{safe_text}{plan_line}\n\n"
+                "💡 *(می‌توانید مستقیماً روی همین پیام Reply بزنید یا از دکمه‌های زیر استفاده کنید)*"
+            )
+            admin_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✉️ پاسخ مستقیم به {raw_name}", callback_data=f"admin_reply_to_{user_id}", style="success")],
+                [
+                    InlineKeyboardButton("➕ تنظیم برنامه جدید", callback_data=f"plan_user_{user_id}", style="primary"),
+                    InlineKeyboardButton("🗂 مشاهده پرونده", callback_data=f"dossier_select_{user_id}", style="primary"),
+                ]
+            ])
+            try:
+                if has_media_report:
+                    copied_media = await context.bot.copy_message(
+                        chat_id=admin_target,
+                        from_chat_id=msg.chat_id,
+                        message_id=msg.message_id
+                    )
+                    if copied_media and getattr(copied_media, "message_id", None):
+                        admin_reply_targets[copied_media.message_id] = user_id
+                sent_alert = await safe_bot_send_message(
+                    context.bot,
+                    chat_id=admin_target,
+                    text=report_alert,
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb
+                )
+                if sent_alert and getattr(sent_alert, "message_id", None):
+                    admin_reply_targets[sent_alert.message_id] = user_id
+            except Exception as e:
+                logger.error(f"Could not alert admin about student message/report: {e}")
+        return
 
 # --- Background Automated Scheduler Loop ---
 
 async def drip_scheduler_loop(app):
     logger.info("Background automated scheduler loop started.")
-    last_run_day = None
 
     while True:
         try:
+            # Never run background scheduled deliveries or backups if this instance is in a getUpdates conflict
+            if _IS_CONFLICTED:
+                await asyncio.sleep(30)
+                continue
+
             async with scheduler_cycle_lock:
                 now_iran = get_iran_now()
                 today_str = now_iran.strftime("%Y-%m-%d")
@@ -3711,34 +4240,34 @@ async def drip_scheduler_loop(app):
                     if quotes_sent > 0:
                         logger.info(f"Daily 7:00 AM motivational quotes delivered to {quotes_sent} students.")
 
-                # 2. Daily Nightly Drip & Milestones Check (Default 23:00)
+                # 2. Daily Nightly Drip & Milestones Check (Default 23:00 or 22:00)
                 target_hour = int(database.get_setting(config.DB_PATH, "drip_send_hour", "23"))
-                last_nightly_date = database.get_setting(config.DB_PATH, "last_nightly_cycle_date", "")
-                if now_iran.hour == target_hour and last_run_day != today_str and last_nightly_date != today_str:
-                    database.set_setting(config.DB_PATH, "last_nightly_cycle_date", today_str)
-                    last_run_day = today_str
-                    logger.info(f"Target hour {target_hour}:00 reached in Iran. Running daily scheduled deliveries...")
-                    milestones_sent = await execute_milestones_check(app.bot)
-                    drip_sent = await execute_drip_cycle(app.bot, force_ignore_interval=False)
-                    logger.info(f"Daily cycle finished. Milestones: {milestones_sent}, Drip: {drip_sent}")
+                if now_iran.hour == target_hour:
+                    if database.claim_nightly_cycle_date(config.DB_PATH, today_str):
+                        logger.info(f"Target hour {target_hour}:00 reached in Iran. Running daily scheduled deliveries...")
+                        milestones_sent = await execute_milestones_check(app.bot)
+                        drip_sent = await execute_drip_cycle(app.bot, force_ignore_interval=False)
+                        logger.info(f"Daily cycle finished. Milestones: {milestones_sent}, Drip: {drip_sent}")
 
-                    # Auto-backup database daily to admin
-                    if config.ADMIN_ID:
-                        try:
-                            await send_database_backup_file(app.bot, config.ADMIN_ID)
-                            logger.info("Sent daily auto-backup database file to admin.")
-                        except Exception as e:
-                            logger.warning(f"Could not send daily backup to admin: {e}")
+                        admin_target = get_active_admin_chat_id()
+                        if admin_target and not _IS_CONFLICTED:
+                            try:
+                                await send_database_backup_file(app.bot, admin_target)
+                                logger.info("Sent daily auto-backup database file to admin.")
+                            except Exception as e:
+                                logger.warning(f"Could not send daily backup to admin: {e}")
 
-                # 3. Hourly Study Plans Reminders
-                plan_reminders = await execute_study_plans_reminders(app.bot)
-                if plan_reminders > 0:
-                    logger.info(f"Sent {plan_reminders} study plan 1-day reminders.")
+                # 3. Study Plans Reminders (Only dispatch between 08:00 and 23:00 Iran time so students aren't woken at night)
+                if 8 <= now_iran.hour <= 23:
+                    plan_reminders = await execute_study_plans_reminders(app.bot)
+                    if plan_reminders > 0:
+                        logger.info(f"Sent {plan_reminders} study plan 1-day reminders.")
 
-                # 4. Inactivity Warnings (every loop check)
-                inactivity_warns = await execute_inactivity_warnings(app.bot)
-                if inactivity_warns > 0:
-                    logger.info(f"Sent {inactivity_warns} inactivity warnings to students.")
+                # 4. Inactivity Warnings (Only dispatch between 08:00 and 23:00 Iran time)
+                if 8 <= now_iran.hour <= 23:
+                    inactivity_warns = await execute_inactivity_warnings(app.bot)
+                    if inactivity_warns > 0:
+                        logger.info(f"Sent {inactivity_warns} inactivity warnings to students.")
 
         except Exception as e:
             logger.error(f"Error in drip_scheduler_loop: {e}")
@@ -3748,18 +4277,25 @@ async def drip_scheduler_loop(app):
 # --- Global Error Handler (Prevents Unhandled Exceptions & Duplicate Polling Conflicts) ---
 
 async def global_error_handler(update: object, context: Any) -> None:
-    global _CONFLICT_COUNT
+    global _CONFLICT_COUNT, _LAST_CONFLICT_TS, _IS_CONFLICTED
     err = getattr(context, "error", None)
     err_str = str(err or "")
     if "terminated by other getupdates request" in err_str.lower() or "conflict" in err_str.lower():
+        now_ts = time.monotonic()
+        if (now_ts - _LAST_CONFLICT_TS) > 90.0:
+            _CONFLICT_COUNT = 0
+        _LAST_CONFLICT_TS = now_ts
         _CONFLICT_COUNT += 1
+        _IS_CONFLICTED = True
         logger.warning(f"Telegram getUpdates Conflict detected (#{_CONFLICT_COUNT}): {err_str}")
-        # If another newer instance is persistently polling the same BOT_TOKEN, exit cleanly to stop duplicate messages
-        if _CONFLICT_COUNT >= 6:
-            logger.error("Persistent getUpdates Conflict detected (>=6 times). Shutting down this duplicate instance to prevent duplicate messages.")
-            os._exit(0)
+        # Exit with CONFLICT_EXIT_CODE (42) so run_workflow.sh knows NOT to respawn this duplicate instance!
+        if _CONFLICT_COUNT >= 4:
+            logger.error(f"Persistent getUpdates Conflict detected (>={_CONFLICT_COUNT} times). Exiting with code {CONFLICT_EXIT_CODE} to stop duplicate instance permanently.")
+            os._exit(CONFLICT_EXIT_CODE)
         return
-    _CONFLICT_COUNT = 0
+    if _IS_CONFLICTED and (time.monotonic() - _LAST_CONFLICT_TS) > 60.0:
+        _IS_CONFLICTED = False
+        _CONFLICT_COUNT = 0
     logger.warning(f"Handled bot exception: {err}")
 
 # --- Application Setup ---
@@ -3801,7 +4337,7 @@ def acquire_single_instance_lock() -> bool:
 
 def main():
     if not acquire_single_instance_lock():
-        sys.exit(0)
+        sys.exit(CONFLICT_EXIT_CODE)
 
     database.init_db(config.DB_PATH)
     logger.info("Database initialized successfully.")
