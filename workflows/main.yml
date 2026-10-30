@@ -1,0 +1,70 @@
+name: 24/7 Live Hot-Reload & Watchdog Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    - cron: "*/30 * * * *"
+
+# جلوگیری قطعی از اجرای همزمان چند ورکفلو و ارسال ۲ یا ۳ باره پیام‌ها به دانش‌آموز و ادمین
+concurrency:
+  group: consulting-bot-single-instance
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Bot with Live Hot-Reload & Watchdog (5.5 Hours Cycle)
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          PORT: "7860"
+        run: |
+          chmod +x run_workflow.sh
+          ./run_workflow.sh
+
+      - name: Save Live Database State Before Next Cycle
+        if: always()
+        run: |
+          if [ -f "consulting_bot.db" ]; then
+            git config user.name "Bot Auto-Sync"
+            git config user.email "bot@users.noreply.github.com"
+            git add consulting_bot.db
+            git commit -m "chore(db): save live database state [skip ci]" || true
+            git push || true
+          fi
+
+      - name: Self Re-Trigger Next 5.5h Cycle Immediately
+        if: success() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "main.yml" --ref "${GITHUB_REF_NAME}" || true

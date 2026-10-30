@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import sqlite3
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
@@ -34,7 +35,7 @@ def parse_db_datetime(val: Any) -> Optional[datetime]:
         return None
 
 def normalize_persian_text(text: Optional[str]) -> str:
-    """Normalizes Persian/Arabic characters and whitespace for accurate name matching."""
+    """Normalizes Persian/Arabic characters, digits, and whitespace for accurate matching."""
     if not text:
         return ""
     s = str(text).strip().lower()
@@ -56,10 +57,29 @@ def normalize_persian_text(text: Optional[str]) -> str:
         "_": " ",
         "-": " ",
         "‌": " ",
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
     }
     for src, dst in replacements.items():
         s = s.replace(src, dst)
     s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def convert_digits_to_english(text: Optional[str]) -> str:
+    """Converts Persian and Arabic-Indic digits to standard ASCII digits."""
+    if not text:
+        return ""
+    s = str(text)
+    digit_map = {
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+    }
+    for k, v in digit_map.items():
+        s = s.replace(k, v)
     return s
 
 def get_connection(db_path: str) -> sqlite3.Connection:
@@ -69,6 +89,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         conn.execute("PRAGMA journal_mode = WAL;")
     except sqlite3.OperationalError:
@@ -100,7 +121,8 @@ def init_db(db_path: str) -> None:
                 "stage_warning_sent INTEGER DEFAULT 0,"
                 "last_drip_sent_at TIMESTAMP NULL,"
                 "day_8_sent INTEGER DEFAULT 0,"
-                "day_30_sent INTEGER DEFAULT 0"
+                "day_30_sent INTEGER DEFAULT 0,"
+                "admin_notified INTEGER DEFAULT 0"
                 ");"
                 "CREATE TABLE IF NOT EXISTS stage_messages ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -109,11 +131,20 @@ def init_db(db_path: str) -> None:
                 "message_id INTEGER NOT NULL,"
                 "caption TEXT NULL,"
                 "package_id INTEGER NULL,"
+                "file_unique_id TEXT NULL,"
                 "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE TABLE IF NOT EXISTS settings ("
                 "key TEXT PRIMARY KEY,"
                 "value TEXT NOT NULL"
+                ");"
+                "CREATE TABLE IF NOT EXISTS user_states ("
+                "user_id INTEGER PRIMARY KEY,"
+                "state TEXT NULL,"
+                "package_id INTEGER NULL,"
+                "broadcast_json TEXT NULL,"
+                "dossier_json TEXT NULL,"
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
                 ");"
                 "CREATE TABLE IF NOT EXISTS delivered_drip_messages ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -197,7 +228,8 @@ def init_db(db_path: str) -> None:
                 "day_8_sent INTEGER DEFAULT 0",
                 "day_30_sent INTEGER DEFAULT 0",
                 "stage_updated_at TIMESTAMP NULL",
-                "stage_warning_sent INTEGER DEFAULT 0"
+                "stage_warning_sent INTEGER DEFAULT 0",
+                "admin_notified INTEGER DEFAULT 0",
             ]:
                 try:
                     conn.execute(f"ALTER TABLE students ADD COLUMN {col_def};")
@@ -206,6 +238,7 @@ def init_db(db_path: str) -> None:
 
             for col_def, tbl in [
                 ("package_id INTEGER NULL", "stage_messages"),
+                ("file_unique_id TEXT NULL", "stage_messages"),
                 ("package_id INTEGER NULL", "delivered_drip_messages"),
                 ("from_chat_id INTEGER NULL", "delivered_drip_messages"),
                 ("source_message_id INTEGER NULL", "delivered_drip_messages"),
@@ -259,6 +292,120 @@ def init_db(db_path: str) -> None:
     finally:
         conn.close()
 
+    # Automatically clean up any duplicate stage messages on startup
+    try:
+        deduplicate_stage_messages(db_path)
+    except Exception:
+        pass
+
+# --- Persistent User State Helpers (Prevents Lost State Across Restarts/Workers) ---
+
+def get_user_state(db_path: str, user_id: int) -> Optional[str]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return row["state"] if row and row["state"] else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def set_user_state(db_path: str, user_id: int, state: Optional[str]) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+                (user_id, state, get_now_utc())
+            )
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+def get_user_package_id(db_path: str, user_id: int) -> Optional[int]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT package_id FROM user_states WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return int(row["package_id"]) if row and row["package_id"] is not None else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def set_user_package_id(db_path: str, user_id: int, package_id: Optional[int]) -> None:
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO user_states (user_id, package_id, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET package_id = excluded.package_id, updated_at = excluded.updated_at",
+                (user_id, package_id, get_now_utc())
+            )
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+def get_pending_broadcast(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT broadcast_json FROM user_states WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row and row["broadcast_json"]:
+            return json.loads(row["broadcast_json"])
+        return None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def set_pending_broadcast(db_path: str, user_id: int, data: Optional[Dict[str, Any]]) -> None:
+    conn = get_connection(db_path)
+    try:
+        raw = json.dumps(data, ensure_ascii=False) if data is not None else None
+        with conn:
+            conn.execute(
+                "INSERT INTO user_states (user_id, broadcast_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET broadcast_json = excluded.broadcast_json, updated_at = excluded.updated_at",
+                (user_id, raw, get_now_utc())
+            )
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+def get_pending_dossier_note(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute("SELECT dossier_json FROM user_states WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row and row["dossier_json"]:
+            return json.loads(row["dossier_json"])
+        return None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def set_pending_dossier_note(db_path: str, user_id: int, data: Optional[Dict[str, Any]]) -> None:
+    conn = get_connection(db_path)
+    try:
+        raw = json.dumps(data, ensure_ascii=False) if data is not None else None
+        with conn:
+            conn.execute(
+                "INSERT INTO user_states (user_id, dossier_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET dossier_json = excluded.dossier_json, updated_at = excluded.updated_at",
+                (user_id, raw, get_now_utc())
+            )
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
 def get_setting(db_path: str, key: str, default: str = "") -> str:
     conn = get_connection(db_path)
     try:
@@ -280,6 +427,46 @@ def set_setting(db_path: str, key: str, value: str) -> None:
     finally:
         conn.close()
 
+def claim_morning_quote_date(db_path: str, today_str: str, total_quotes: int) -> Tuple[bool, int]:
+    """Atomically checks and claims today's morning quote delivery so it can never be sent twice."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute("SELECT value FROM settings WHERE key = 'last_morning_quote_date'")
+        row = cur.fetchone()
+        last_date = row["value"] if row else ""
+        if last_date == today_str:
+            conn.rollback()
+            return False, 0
+
+        cur_idx_row = conn.execute("SELECT value FROM settings WHERE key = 'morning_quote_index'").fetchone()
+        try:
+            curr_idx = int(cur_idx_row["value"]) if cur_idx_row else 0
+        except ValueError:
+            curr_idx = 0
+
+        next_idx = (curr_idx + 1) % max(1, total_quotes)
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('last_morning_quote_date', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (today_str,)
+        )
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('morning_quote_index', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(next_idx),)
+        )
+        conn.commit()
+        return True, curr_idx
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, 0
+    finally:
+        conn.close()
+
 def create_invite(db_path: str, code: str, assigned_name: Optional[str] = None) -> str:
     conn = get_connection(db_path)
     try:
@@ -292,39 +479,87 @@ def create_invite(db_path: str, code: str, assigned_name: Optional[str] = None) 
         conn.close()
     return code
 
-def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Optional[str], full_name: str) -> Tuple[bool, Optional[str]]:
+def get_invite(db_path: str, code: str) -> Optional[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
-        with conn:
-            cur = conn.execute(
-                "SELECT code, assigned_name, is_used FROM invites WHERE code = ?",
-                (code,)
-            )
-            invite = cur.fetchone()
-            if not invite or invite["is_used"] == 1:
-                return False, None
+        cur = conn.execute(
+            "SELECT code, assigned_name, created_at, is_used, used_by, used_at FROM invites WHERE code = ?",
+            (code,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
-            assigned_name = invite["assigned_name"]
-            now = get_now_utc()
-            conn.execute(
-                "UPDATE invites SET is_used = 1, used_by = ?, used_at = ? WHERE code = ?",
-                (user_id, now, code)
-            )
+def validate_and_use_invite(db_path: str, code: str, user_id: int, username: Optional[str], full_name: str) -> Tuple[bool, Optional[str]]:
+    """
+    Atomically validates and marks an invite code as used using BEGIN IMMEDIATE.
+    Prevents race conditions when a student taps Start multiple times concurrently.
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "SELECT code, assigned_name, is_used, used_by FROM invites WHERE code = ?",
+            (code,)
+        )
+        invite = cur.fetchone()
+        if not invite or invite["is_used"] == 1:
+            conn.rollback()
+            return False, None
 
-            # Remove from removed_students if re-invited with a fresh invite link
-            conn.execute("DELETE FROM removed_students WHERE user_id = ?", (user_id,))
+        assigned_name = invite["assigned_name"]
+        now = get_now_utc()
+        upd = conn.execute(
+            "UPDATE invites SET is_used = 1, used_by = ?, used_at = ? WHERE code = ? AND is_used = 0",
+            (user_id, now, code)
+        )
+        if upd.rowcount == 0:
+            conn.rollback()
+            return False, None
 
-            conn.execute(
-                "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, day_8_sent, day_30_sent) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0) "
-                "ON CONFLICT(user_id) DO UPDATE SET "
-                "username = excluded.username, "
-                "full_name = excluded.full_name, "
-                "assigned_name = COALESCE(excluded.assigned_name, students.assigned_name), "
-                "last_active = excluded.last_active",
-                (user_id, username, full_name, assigned_name, now, now, now)
-            )
+        # Remove from removed_students if re-invited with a fresh invite link
+        conn.execute("DELETE FROM removed_students WHERE user_id = ?", (user_id,))
+
+        conn.execute(
+            "INSERT INTO students (user_id, username, full_name, assigned_name, current_stage, registered_at, last_active, stage_updated_at, stage_warning_sent, day_8_sent, day_30_sent, admin_notified) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, 0, 0, 0) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "username = excluded.username, "
+            "full_name = excluded.full_name, "
+            "assigned_name = COALESCE(excluded.assigned_name, students.assigned_name), "
+            "last_active = excluded.last_active",
+            (user_id, username, full_name, assigned_name, now, now, now)
+        )
+        conn.commit()
         return True, assigned_name
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, None
+    finally:
+        conn.close()
+
+def claim_admin_registration_notification(db_path: str, user_id: int) -> bool:
+    """Atomically marks that the admin was notified of this student's registration. Returns True only once."""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE students SET admin_notified = 1 WHERE user_id = ? AND (admin_notified IS NULL OR admin_notified = 0)",
+            (user_id,)
+        )
+        claimed = cur.rowcount > 0
+        conn.commit()
+        return claimed
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
     finally:
         conn.close()
 
@@ -373,7 +608,7 @@ def get_student_sent_messages(db_path: str, user_id: int) -> List[int]:
         conn.close()
 
 def delete_student_completely(db_path: str, user_id: int) -> Optional[Dict[str, Any]]:
-    """Deletes a student and all their capabilities, study plans, delivery logs, and dossier records."""
+    """Deletes a student and all their capabilities, study plans, delivery logs, states, and dossier records."""
     conn = get_connection(db_path)
     try:
         with conn:
@@ -395,6 +630,7 @@ def delete_student_completely(db_path: str, user_id: int) -> Optional[Dict[str, 
                 )
             )
             conn.execute("DELETE FROM students WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM study_plans WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM student_dossier WHERE user_id = ?", (user_id,))
             conn.execute("DELETE FROM delivered_messages WHERE user_id = ?", (user_id,))
@@ -494,11 +730,19 @@ def get_students_due_for_milestones(db_path: str) -> List[Tuple[Dict[str, Any], 
     finally:
         conn.close()
 
-def add_stage_message(db_path: str, stage: int, from_chat_id: int, message_id: int, caption: Optional[str] = None, package_id: Optional[int] = None) -> int:
+def add_stage_message(
+    db_path: str,
+    stage: int,
+    from_chat_id: int,
+    message_id: int,
+    caption: Optional[str] = None,
+    package_id: Optional[int] = None,
+    file_unique_id: Optional[str] = None
+) -> int:
     conn = get_connection(db_path)
     try:
         with conn:
-            # Prevent duplicate upload of the exact same message in the same stage
+            # 1. Prevent duplicate upload of the exact same (from_chat_id, message_id) in the same stage
             existing = conn.execute(
                 "SELECT id FROM stage_messages WHERE stage = ? AND from_chat_id = ? AND message_id = ? LIMIT 1",
                 (stage, from_chat_id, message_id)
@@ -506,9 +750,27 @@ def add_stage_message(db_path: str, stage: int, from_chat_id: int, message_id: i
             if existing:
                 return existing["id"]
 
+            # 2. Prevent duplicate upload of the same media file (via Telegram file_unique_id) in the same stage
+            if file_unique_id:
+                existing_uid = conn.execute(
+                    "SELECT id FROM stage_messages WHERE stage = ? AND file_unique_id = ? LIMIT 1",
+                    (stage, file_unique_id)
+                ).fetchone()
+                if existing_uid:
+                    return existing_uid["id"]
+
+            # 3. For pure text messages or long captions without file_unique_id, prevent exact duplicate text in the same stage
+            if not file_unique_id and caption and len(caption.strip()) >= 15:
+                existing_cap = conn.execute(
+                    "SELECT id FROM stage_messages WHERE stage = ? AND file_unique_id IS NULL AND caption = ? LIMIT 1",
+                    (stage, caption)
+                ).fetchone()
+                if existing_cap:
+                    return existing_cap["id"]
+
             cur = conn.execute(
-                "INSERT INTO stage_messages (stage, from_chat_id, message_id, caption, package_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (stage, from_chat_id, message_id, caption, package_id, get_now_utc())
+                "INSERT INTO stage_messages (stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (stage, from_chat_id, message_id, caption, package_id, file_unique_id, get_now_utc())
             )
             inserted_id = cur.lastrowid
             if package_id is None:
@@ -517,11 +779,77 @@ def add_stage_message(db_path: str, stage: int, from_chat_id: int, message_id: i
     finally:
         conn.close()
 
+def deduplicate_stage_messages(db_path: str) -> int:
+    """Removes duplicate stage messages within the same stage (same message_id, same file_unique_id, or identical long text)."""
+    conn = get_connection(db_path)
+    removed = 0
+    try:
+        with conn:
+            rows = conn.execute(
+                "SELECT id, stage, from_chat_id, message_id, caption, file_unique_id FROM stage_messages ORDER BY id ASC"
+            ).fetchall()
+            seen_msg_keys = set()
+            seen_uid_keys = set()
+            seen_cap_keys = set()
+            to_delete = []
+
+            for r in rows:
+                rid = r["id"]
+                st = r["stage"]
+                fchat = r["from_chat_id"]
+                mid = r["message_id"]
+                fuid = r["file_unique_id"]
+                cap = (r["caption"] or "").strip()
+
+                msg_key = (st, fchat, mid)
+                if msg_key in seen_msg_keys:
+                    to_delete.append(rid)
+                    continue
+                seen_msg_keys.add(msg_key)
+
+                if fuid:
+                    uid_key = (st, fuid)
+                    if uid_key in seen_uid_keys:
+                        to_delete.append(rid)
+                        continue
+                    seen_uid_keys.add(uid_key)
+                elif len(cap) >= 15:
+                    cap_key = (st, cap)
+                    if cap_key in seen_cap_keys:
+                        to_delete.append(rid)
+                        continue
+                    seen_cap_keys.add(cap_key)
+
+            for rid in to_delete:
+                conn.execute("DELETE FROM stage_messages WHERE id = ?", (rid,))
+                removed += 1
+        return removed
+    finally:
+        conn.close()
+
+def delete_stage_message_by_id(db_path: str, record_id: int) -> Optional[Dict[str, Any]]:
+    """Deletes a single stage message by its primary key ID and returns the deleted record."""
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "SELECT id, stage, from_chat_id, message_id, caption, package_id FROM stage_messages WHERE id = ?",
+                (record_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            conn.execute("DELETE FROM stage_messages WHERE id = ?", (record_id,))
+            return item
+    finally:
+        conn.close()
+
 def get_stage_messages(db_path: str, stage: int) -> List[Dict[str, Any]]:
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT id, stage, from_chat_id, message_id, caption, package_id, created_at FROM stage_messages WHERE stage = ? ORDER BY id ASC",
+            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at FROM stage_messages WHERE stage = ? ORDER BY id ASC",
             (stage,)
         )
         return [dict(row) for row in cur.fetchall()]
@@ -553,7 +881,7 @@ def get_stage_packages(db_path: str, stage: int = 4) -> List[List[Dict[str, Any]
     conn = get_connection(db_path)
     try:
         cur = conn.execute(
-            "SELECT id, stage, from_chat_id, message_id, caption, package_id, created_at "
+            "SELECT id, stage, from_chat_id, message_id, caption, package_id, file_unique_id, created_at "
             "FROM stage_messages WHERE stage = ? ORDER BY id ASC",
             (stage,)
         )
@@ -773,11 +1101,12 @@ def get_eligible_students_for_drip(db_path: str, force_ignore_interval: bool = F
 # --- Study Plans (Periodic 7-day, 8-day, 9-day schedules) ---
 
 def create_study_plan(db_path: str, user_id: int, duration_days: int) -> int:
+    duration_days = max(1, min(365, int(duration_days)))
     conn = get_connection(db_path)
     try:
         with conn:
             # Mark previous active plans as superseded
-            conn.execute("UPDATE study_plans SET status = 'SUPERSEDED' WHERE user_id = ? AND status = 'ACTIVE'", (user_id,))
+            conn.execute("UPDATE study_plans SET status = 'SUPERSEDED' WHERE user_id = ? AND status IN ('ACTIVE', 'REMINDER_SENT')", (user_id,))
 
             now = get_now_utc()
             end_date = now + timedelta(days=duration_days)
@@ -814,7 +1143,7 @@ def get_study_plans_due_for_reminder(db_path: str) -> List[Dict[str, Any]]:
         now = get_now_utc()
         cur = conn.execute(
             "SELECT sp.id, sp.user_id, sp.duration_days, sp.start_date, sp.end_date, sp.reminder_date, "
-            "s.full_name, s.assigned_name, s.username "
+            "s.full_name, s.assigned_name, s.username, s.current_stage "
             "FROM study_plans sp "
             "JOIN students s ON sp.user_id = s.user_id "
             "WHERE sp.status = 'ACTIVE' AND sp.reminder_sent = 0 AND sp.reminder_date <= ?",
@@ -891,13 +1220,11 @@ def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
     src = None
     dst = None
     try:
-        # Check if file is a valid SQLite database or an SQL script dump
         with open(backup_file_path, "rb") as f:
             header = f.read(16)
 
         if header.startswith(b"SQLite format 3"):
             src = sqlite3.connect(backup_file_path, timeout=30.0)
-            # Verify integrity and tables
             src.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
             dst = sqlite3.connect(target_db_path, timeout=30.0)
             try:
@@ -907,15 +1234,22 @@ def restore_database_backup(backup_file_path: str, target_db_path: str) -> bool:
             with dst:
                 src.backup(dst)
             dst.commit()
+            dst.close()
+            dst = None
+            src.close()
+            src = None
+            init_db(target_db_path)
             return True
         else:
-            # Try restoring from SQL text dump if user uploaded a .sql backup
             with open(backup_file_path, "r", encoding="utf-8", errors="ignore") as f:
                 sql_script = f.read()
             if "CREATE TABLE" in sql_script.upper() or "INSERT INTO" in sql_script.upper():
                 dst = get_connection(target_db_path)
                 with dst:
                     dst.executescript(sql_script)
+                dst.close()
+                dst = None
+                init_db(target_db_path)
                 return True
             return False
     except Exception:

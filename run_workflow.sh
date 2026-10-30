@@ -8,7 +8,7 @@ START_TIME=$(date +%s)
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
 
 echo "========================================================"
-echo "🚀 راه‌اندازی ربات با مکانیزم ترکیبی Hot-Reload (۳ ثانیه) و Watchdog"
+echo "🚀 راه‌اندازی ربات با مکانیزم ترکیبی Hot-Reload (۳ ثانیه)، Single-Instance Lock و Watchdog"
 echo "🔌 پورت فعال: $PORT | ⏱ زمان سیکل: ۳۳۵ دقیقه (۵.۵ ساعت)"
 echo "========================================================"
 
@@ -28,14 +28,50 @@ if command -v cloudflared >/dev/null 2>&1; then
   fi
 fi
 
+flush_and_backup_db() {
+  if [ -f "$DB_FILE" ]; then
+    python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('$DB_FILE', timeout=10.0)
+    conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+    conn.close()
+except Exception:
+    pass
+" 2>/dev/null || true
+    cp -f "$DB_FILE" "/tmp/hotreload_backup_${DB_FILE}" 2>/dev/null || true
+  fi
+}
+
+sync_db_to_git() {
+  flush_and_backup_db
+  if [ -f "$DB_FILE" ] && command -v git >/dev/null 2>&1; then
+    git config user.name "Bot Auto-Sync" 2>/dev/null || true
+    git config user.email "bot@users.noreply.github.com" 2>/dev/null || true
+    git add "$DB_FILE" 2>/dev/null || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+      git commit -m "chore(db): auto-sync live database state [skip ci]" --quiet 2>/dev/null || true
+      git push origin "HEAD:$BRANCH" --quiet 2>/dev/null || true
+    fi
+  fi
+}
+
 free_port_and_stop_bot() {
   if [ -n "${BOT_PID:-}" ] && kill -0 "$BOT_PID" 2>/dev/null; then
     kill -TERM "$BOT_PID" 2>/dev/null || true
-    sleep 0.4
+    for _ in 1 2 3 4 5; do
+      if ! kill -0 "$BOT_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.3
+    done
     kill -9 "$BOT_PID" 2>/dev/null || true
+    wait "$BOT_PID" 2>/dev/null || true
   fi
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
   pkill -9 -f "python.*bot.py" >/dev/null 2>&1 || true
+  rm -f /tmp/consulting_bot_single_instance.lock 2>/dev/null || true
+  sleep 0.5
 }
 
 start_bot() {
@@ -46,9 +82,13 @@ start_bot() {
   echo "✅ bot.py با شناسه PID=$BOT_PID فعال شد."
 }
 
+trap 'free_port_and_stop_bot; sync_db_to_git' EXIT INT TERM
+
 BOT_PID=""
 LAST_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
 start_bot
+
+LAST_DB_SYNC=$(date +%s)
 
 while true; do
   NOW=$(date +%s)
@@ -56,14 +96,15 @@ while true; do
 
   # پایان سیکل ۵.۵ ساعته (۳۳۵ دقیقه) جهت اجرای گام Self Re-Trigger
   if [ "$ELAPSED" -ge "$CYCLE_SECONDS" ]; then
-    echo "⏰ پایان سیکل ۳۳۵ دقیقه‌ای (۵.۵ ساعت). آماده‌سازی برای انتقال بدون وقفه به سیکل بعدی..."
+    echo "⏰ پایان سیکل ۳۳۵ دقیقه‌ای (۵.۵ ساعت). ذخیره دیتابیس و آماده‌سازی برای انتقال بدون وقفه به سیکل بعدی..."
     free_port_and_stop_bot
+    sync_db_to_git
     break
   fi
 
   # ۱. مکانیزم Watchdog (ضد کرش): بررسی زنده بودن ربات و بالا آوردن مجدد فوری
   if ! kill -0 "$BOT_PID" 2>/dev/null; then
-    echo "⚠️ [Watchdog] پردازش bot.py متوقف شده است! ری‌استارت خودکار در کسری از ثانیه..."
+    echo "⚠️ [Watchdog] پردازش bot.py متوقف شده است! ری‌استارت خودکار..."
     start_bot
   fi
 
@@ -73,26 +114,24 @@ while true; do
     if [ -n "$REMOTE_COMMIT" ] && [ "$REMOTE_COMMIT" != "$LAST_COMMIT" ]; then
       echo "🔄 [Hot-Reload] تغییر جدید در مخزن شناسایی شد ($LAST_COMMIT -> $REMOTE_COMMIT)!"
 
-      # بکاپ ایمن از دیتابیس فعلی در حافظه موقت قبل از آپدیت کدها
-      if [ -f "$DB_FILE" ]; then
-        sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-        cp -f "$DB_FILE" "/tmp/hotreload_backup_${DB_FILE}"
-      fi
-
-      # بررسی اینکه آیا خود کاربر فایل دیتابیس جدیدی را مستقیماً در گیت‌هاب آپلود کرده است یا خیر
+      # ابتدا بررسی تغییرات قبل از ریست
       DB_CHANGED_IN_GIT=$(git diff --name-only "$LAST_COMMIT" "$REMOTE_COMMIT" -- "$DB_FILE" 2>/dev/null || echo "")
+      REQ_CHANGED=$(git diff --name-only "$LAST_COMMIT" "$REMOTE_COMMIT" -- "requirements.txt" 2>/dev/null || echo "")
+
+      # توقف ایمن ربات و بکاپ گرفتن از دیتابیس فعلی قبل از آپدیت کدها
+      free_port_and_stop_bot
+      flush_and_backup_db
 
       # دانلود آنی تغییرات مخزن
       git reset --hard "origin/$BRANCH" --quiet
       git clean -fd --exclude="$DB_FILE" --exclude="${DB_FILE}-wal" --exclude="${DB_FILE}-shm" --quiet
 
-      # اگر کاربر فایل دیتابیس را در گیت تغییر نداده بود، دیتابیس در حالِ کارِ فعلی (شامل بکاپ‌های ارسالی در تلگرام) را حفظ کن
+      # اگر کاربر فایل دیتابیس را در گیت تغییر نداده بود، دیتابیس در حالِ کارِ فعلی را حفظ کن
       if [ -z "$DB_CHANGED_IN_GIT" ] && [ -f "/tmp/hotreload_backup_${DB_FILE}" ]; then
         cp -f "/tmp/hotreload_backup_${DB_FILE}" "$DB_FILE"
       fi
 
       # اگر requirements.txt تغییر کرده بود، پکیج‌های جدید را نصب کن
-      REQ_CHANGED=$(git diff --name-only "$LAST_COMMIT" "$REMOTE_COMMIT" -- "requirements.txt" 2>/dev/null || echo "")
       if [ -n "$REQ_CHANGED" ] && [ -f "requirements.txt" ]; then
         pip install -q -r requirements.txt || true
       fi
